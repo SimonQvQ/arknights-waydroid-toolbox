@@ -1,0 +1,2 @@
+#!/bin/sh
+exec /opt/arknights-waydroid-toolbox/arknights_waydroid_toolbox "$@"

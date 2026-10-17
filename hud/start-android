@@ -1,0 +1,40 @@
+#!/usr/bin/python3
+import signal
+import subprocess
+import sys
+import time
+
+session = subprocess.Popen(['/usr/bin/waydroid', 'show-full-ui'])
+def stop(signum, frame):
+    session.terminate()
+signal.signal(signal.SIGTERM, stop)
+signal.signal(signal.SIGINT, stop)
+try:
+    for attempt in range(60):
+        if session.poll() is not None:
+            sys.exit(session.returncode)
+        try:
+            boot = subprocess.run(['/usr/bin/waydroid', 'prop', 'get', 'sys.boot_completed'],
+                                  text=True, capture_output=True, timeout=3)
+            if boot.stdout.strip() == '1':
+                time.sleep(1)
+                subprocess.run(['/usr/bin/waydroid', 'app', 'launch', 'com.hypergryph.arknights'],
+                               timeout=15, check=True)
+                # show-full-ui briefly expands the shade to refresh Android's display.
+                # Finish with the panel collapsed after the game has been launched.
+                subprocess.run(['/usr/bin/python3', '-c',
+                    "import sys,argparse; sys.path.insert(0,'/usr/lib/waydroid'); "
+                    "import tools; from tools.interfaces import IStatusBarService; "
+                    "a=argparse.Namespace(); tools.prep_args(a); "
+                    "s=IStatusBarService.get_service(a); s.collapse() if s else None"],
+                    timeout=8, check=False)
+                break
+        except subprocess.TimeoutExpired:
+            pass
+        time.sleep(1)
+    else:
+        raise RuntimeError('Android did not finish booting in time')
+    sys.exit(session.wait())
+finally:
+    if session.poll() is None:
+        session.terminate()

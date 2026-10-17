@@ -1,0 +1,5 @@
+#!/bin/sh
+# MangoApp needs Xwayland even when Waydroid uses Gamescope's Wayland socket.
+unset WAYLAND_DISPLAY
+export XDG_SESSION_TYPE=x11
+exec /usr/bin/mangoapp "$@"

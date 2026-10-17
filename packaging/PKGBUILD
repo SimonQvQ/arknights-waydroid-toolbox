@@ -1,0 +1,19 @@
+pkgname=arknights-waydroid-toolbox-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Flutter toolbox for Waydroid, MAA scheduling and MuMu-compatible screenshots'
+arch=('x86_64')
+license=('MIT')
+depends=('gtk3' 'python' 'python-pillow' 'systemd' 'waydroid' 'lutris' 'wine')
+options=('!strip' '!debug')
+source=('toolbox-bundle.tar.gz')
+sha256sums=('e7791d3e8f1da137dbdbabf4b1d4d0c11f35221d4684591f2e5337a19a40c29b')
+package() {
+  install -dm755 "$pkgdir/opt/arknights-waydroid-toolbox"
+  cp -a "$srcdir/bundle/." "$pkgdir/opt/arknights-waydroid-toolbox/"
+  install -Dm755 "$srcdir/packaging/arknights-toolbox" "$pkgdir/usr/bin/arknights-toolbox"
+  install -Dm644 "$srcdir/toolbox.py" "$pkgdir/usr/lib/arknights-waydroid-toolbox/toolbox.py"
+  install -Dm644 "$srcdir/packaging/arknights-toolbox.desktop" "$pkgdir/usr/share/applications/arknights-toolbox.desktop"
+  install -Dm644 "$srcdir/packaging/arknights-toolbox.svg" "$pkgdir/usr/share/icons/hicolor/scalable/apps/arknights-toolbox.svg"
+  install -Dm644 "$srcdir/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

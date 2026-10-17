@@ -1,0 +1,59 @@
+#!/usr/bin/python3
+"""Run the installed Android game in Gamescope with a visible MangoApp HUD."""
+import fcntl
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+home = Path.home()
+runtime = Path(os.environ.get('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}'))
+lock = (runtime / 'arknights-waydroid-hud.lock').open('a+')
+try:
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    try:
+        lock.seek(0)
+        pid = int(lock.read().strip())
+        windows = json.loads(subprocess.check_output(['niri', 'msg', '-j', 'windows']))
+        window = next((w for w in windows if w.get('pid') == pid), None)
+        if window:
+            subprocess.run(['niri', 'msg', 'action', 'focus-window', '--id', str(window['id'])])
+    except (ValueError, OSError, subprocess.SubprocessError):
+        pass
+    sys.exit(0)
+
+# A running Android compositor cannot be moved between Wayland sockets.
+status = subprocess.check_output(['/usr/bin/waydroid', 'status'], text=True)
+if 'RUNNING' in status or 'FROZEN' in status:
+    subprocess.run(['/usr/bin/waydroid', 'session', 'stop'], check=True, timeout=40)
+
+env = os.environ.copy()
+for key in ('LD_PRELOAD', 'MANGOHUD', 'MANGOHUD_CONFIG', 'MANGOHUD_CONFIGFILE',
+            'ENABLE_HDR_WSI', 'PROTON_ENABLE_HDR'):
+    env.pop(key, None)
+env['PATH'] = str(home / '.local/lib/waydroid-mangoapp/bin') + ':' + env.get('PATH', '/usr/bin')
+env['DISABLE_GAMESCOPE_WSI'] = '1'
+env['SDL_VIDEODRIVER'] = 'wayland'
+env['MANGOHUD_CONFIGFILE'] = str(home / '.local/share/goverlay/gameconfig/global/MangoHud.conf')
+# Explicitly include useful metrics, while keeping GOverlay's appearance and keys.
+env['MANGOHUD_CONFIG'] = 'fps,frametime,frame_timing,cpu_stats,cpu_temp,cpu_mhz,gpu_stats,ram,font_size=20,position=top-left,toggle_hud=Shift_R+F12'
+command = [
+    '/usr/bin/gamescope', '--backend', 'sdl', '--mangoapp',
+    '--force-windows-fullscreen',
+    '-w', '1280', '-h', '720', '-W', '1600', '-H', '900', '-r', '60', '-f', '--',
+    '/usr/bin/weston', '--backend=x11', '--renderer=gl', '--shell=kiosk-shell.so',
+    '--width=1280', '--height=720', '--fullscreen', '--idle-time=0',
+    '--socket=waydroid-mangoapp', '--no-config', '--',
+    str(home / '.local/lib/waydroid-mangoapp/start-android'),
+]
+logdir = home / '.local/state/waydroid-mangoapp'
+logdir.mkdir(parents=True, exist_ok=True)
+with (logdir / 'launch.log').open('w') as log:
+    process = subprocess.Popen(command, env=env, cwd=home, stdout=log, stderr=subprocess.STDOUT)
+    lock.seek(0)
+    lock.truncate()
+    lock.write(str(process.pid))
+    lock.flush()
+    sys.exit(process.wait())

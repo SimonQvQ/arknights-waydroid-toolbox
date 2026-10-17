@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=方舟 Waydroid 工具箱
+Name[zh_CN]=方舟 Waydroid 工具箱
+Comment=游戏启动、MAA 定时与快速截图
+Exec=arknights-toolbox
+Icon=arknights-toolbox
+Terminal=false
+Categories=Game;Utility;
+StartupWMClass=io.simon.arknights_waydroid_toolbox
