@@ -177,11 +177,24 @@ def desktop_env():
 
 
 def launch(command, name, env=None):
-    log = (STATE / f'{name}.log').open('a')
-    p = subprocess.Popen(command, env=env or desktop_env(), stdout=log, stderr=subprocess.STDOUT,
-                         start_new_session=True, cwd=HOME)
-    log.close()
-    return p.pid
+    # A detached Unix session still belongs to its parent's systemd cgroup.
+    # Give GUI applications their own unit so a completed preparation oneshot
+    # cannot kill Waydroid, Lutris or MAA through KillMode=control-group.
+    environment = env or desktop_env()
+    unit = f'{PREFIX}app-{name}-{time.time_ns()}.service'
+    args = ['systemd-run', '--user', '--quiet', '--collect', '--service-type=exec',
+            '--unit=' + unit, '--working-directory=' + str(HOME),
+            '--property=ExitType=cgroup',
+            '--property=StandardOutput=append:' + str(STATE / f'{name}.log'),
+            '--property=StandardError=inherit']
+    for key in ('PATH', 'DISPLAY', 'WAYLAND_DISPLAY', 'NIRI_SOCKET', 'XDG_RUNTIME_DIR',
+                'DBUS_SESSION_BUS_ADDRESS', 'XAUTHORITY', 'XDG_SESSION_TYPE',
+                'XDG_CURRENT_DESKTOP', 'XDG_SESSION_DESKTOP', 'PULSE_SERVER',
+                'WINEPREFIX', 'WINEDEBUG'):
+        if key in environment:
+            args.append('--setenv=' + key + '=' + environment[key])
+    run(args + ['--'] + command, timeout=15, env=environment)
+    return unit
 
 
 def game_start(focus=True):
@@ -194,7 +207,7 @@ def game_start(focus=True):
     launcher = Path(settings()['hud_launcher'])
     if not launcher.is_file():
         raise RuntimeError(f'找不到启动器：{launcher}')
-    return {'message': '正在启动明日方舟与 HUD', 'pid': launch([str(launcher)], 'waydroid')}
+    return {'message': '正在启动明日方舟与 HUD', 'unit': launch([str(launcher)], 'waydroid')}
 
 
 def maa_start(focus=True):
@@ -206,7 +219,7 @@ def maa_start(focus=True):
     game_id = int(settings()['lutris_game_id'])
     if game_id <= 0:
         raise RuntimeError('请设置有效的 lutris_game_id')
-    return {'message': '正在通过 Lutris 启动 MAA', 'pid': launch(['lutris', f'lutris:rungameid/{game_id}'], 'maa')}
+    return {'message': '正在通过 Lutris 启动 MAA', 'unit': launch(['lutris', f'lutris:rungameid/{game_id}'], 'maa')}
 
 
 def warm_touch(adb, address, env):
@@ -291,7 +304,7 @@ def scheduler_units(config, prefs, executable=None):
         hour, minute = item['prepare'].split(':')
         result[base + '.service'] = (
             '[Unit]\nDescription=Prepare Waydroid and MAA before ' + item['time'] + '\n'
-            '\n[Service]\nType=oneshot\nTimeoutStartSec=240\n'
+            '\n[Service]\nType=oneshot\nTimeoutStartSec=420\n'
             'ExecStart=/usr/bin/python3 "' + executable.replace('"', '\\"') + '" prepare --slot ' + str(item['id']) + '\n')
         result[base + '.timer'] = (
             '[Unit]\nDescription=Waydroid/MAA preparation for ' + item['time'] + '\n'
@@ -378,22 +391,27 @@ def prepare(slot_id, dry_run=False):
         game_start(focus=False)
         deadline = time.monotonic() + 200
         while time.monotonic() < deadline:
-            status = waydroid_status()
-            if status.get('Container') == 'RUNNING' and status.get('IP address') not in (None, '', 'UNKNOWN'):
-                boot = run(['waydroid', 'prop', 'get', 'sys.boot_completed'], timeout=5, check=False)
-                if boot == '1':
-                    break
+            try:
+                status = waydroid_status()
+                if status.get('Container') == 'RUNNING' and status.get('IP address') not in (None, '', 'UNKNOWN'):
+                    boot = run(['waydroid', 'prop', 'get', 'sys.boot_completed'], timeout=5, check=False)
+                    if boot == '1':
+                        break
+            except subprocess.TimeoutExpired:
+                # Binder/property calls can stall briefly during Android boot.
+                pass
             time.sleep(2)
         else:
             raise RuntimeError('Waydroid 启动超时，请查看启动日志')
         address = status['IP address'] + ':5555'
         env = desktop_env()
-        env.update(WINEPREFIX=prefs['wine_prefix'], WINEDEBUG='-all')
+        env.update(WINEPREFIX=prefs['wine_prefix'], WINEDEBUG='-all',
+                   WINEESYNC='0', WINEFSYNC='0', WINEDLLOVERRIDES='winemenubuilder=')
         adb = Path(prefs['maa_dir']) / 'platform-tools/adb.exe'
-        run(['wine', str(adb), 'connect', address], timeout=20, env=env)
-        # Preserve an active MAA configuration; only update its address while stopped.
-        if not maa_running():
-            touch_ready = warm_touch(adb, address, env)
+        cold_maa = not maa_running()
+        # Bootstrap Wine in MAA's independent unit, not in this short-lived
+        # preparation cgroup (which would take Wine/ADB down when it finishes).
+        if cold_maa:
             path, config = maa_config()
             for values in config.get('Configurations', {}).values():
                 connection = values.get('Gui', {}).get('ConnectSettings')
@@ -401,8 +419,24 @@ def prepare(slot_id, dry_run=False):
                     connection['Address'] = address
             atomic_json(path, config)
             maa_start(focus=False)
-        else:
-            touch_ready = True
+            deadline = time.monotonic() + 60
+            while not maa_running():
+                if time.monotonic() >= deadline:
+                    raise RuntimeError('MAA 启动超时，请查看 maa.log')
+                time.sleep(1)
+        deadline = time.monotonic() + 60
+        while True:
+            try:
+                run(['wine', str(adb), 'connect', address], timeout=20, env=env)
+                device = run(['wine', str(adb), '-s', address, 'get-state'], timeout=10, env=env)
+                if device == 'device':
+                    break
+            except (subprocess.TimeoutExpired, RuntimeError):
+                pass
+            if time.monotonic() >= deadline:
+                raise RuntimeError('ADB 未就绪或尚未授权，请查看 MAA 连接设置')
+            time.sleep(2)
+        touch_ready = warm_touch(adb, address, env) if cold_maa else True
         result = {'message': f'已为 {item["time"]} 准备好 Waydroid 与 MAA；任务由 MAA 到点执行', 'slot': item}
         if not touch_ready:
             result['warning'] = 'MaaTouch 预热未完成，请检查 MAA 连接测试'
@@ -453,7 +487,7 @@ def main():
                    'sync': sync_schedule, 'prepare': lambda: prepare(a.slot, a.dry_run),
                    'game-stop': lambda: {'message': run(['waydroid', 'session', 'stop'], timeout=40) or 'Waydroid 已停止'},
                    'logs': lambda: {'text': run(['journalctl', '--user', '-u', PREFIX+'*', '-u', 'waydroid-mumu-capture.service', '-n', '60', '--no-pager'], check=False)},
-                   'config-folder': lambda: {'pid': launch(['xdg-open', str(Path(settings()['maa_dir'])/'config')], 'folder')}}
+                   'config-folder': lambda: {'unit': launch(['xdg-open', str(Path(settings()['maa_dir'])/'config')], 'folder')}}
         print(json.dumps({'ok': True, 'data': actions[a.action]()}, ensure_ascii=False))
     except Exception as e:
         print(json.dumps({'ok': False, 'error': str(e)}, ensure_ascii=False))

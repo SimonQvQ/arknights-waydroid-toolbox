@@ -15,6 +15,8 @@ Flutter Linux 桌面工具：整合《明日方舟》Waydroid HUD 启动器、MA
 
 **有效。** Linux 在 MAA 定时前 5 分钟按需启动 Waydroid、连接 ADB 并启动 MAA；已有会话不会被定时准备重启。到点由 **MAA 自己** 执行其配置好的任务，工具箱不复制任务队列，也不直接调用任务执行 API。
 
+启动的图形应用使用独立的 systemd 用户服务，定时准备结束后继续运行；HUD 启动器会回收失去 Weston 的残留 Gamescope，避免启动锁阻塞。Android 与 Wine 冷启动的短暂查询失败会自动重试。
+
 工具箱窗口不必常驻；关闭窗口后也不会立刻重新弹出。电脑需要已登录图形桌面并保持唤醒；不自动开机或唤醒睡眠，不补跑错过的时间。MAA 的半选单次定时仍由 MAA 管理，不转换成每日重复任务。
 
 定时单元为 `arknights-toolbox-slot-0.timer` 等，仅管理自己的 0–7 号槽位。配置读取失败时保留已有定时器。准备失败可在日志页面查看，不能据此保证游戏任务成功完成。
@@ -30,6 +32,7 @@ flutter pub get
 flutter analyze
 flutter test
 python backend/test_toolbox.py
+python hud/test_lifecycle.py
 flutter build linux --release
 
 # Arch/CachyOS 本地打包（尚未发布 AUR）

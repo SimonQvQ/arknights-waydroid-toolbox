@@ -4,8 +4,75 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
+import time
+
+
+def process_args(pid):
+    try:
+        proc = Path('/proc') / str(pid)
+        if proc.stat().st_uid != os.getuid():
+            return []
+        return [os.fsdecode(x) for x in (proc / 'cmdline').read_bytes().split(b'\0') if x]
+    except OSError:
+        return []
+
+
+def owned_gamescope(pid):
+    args = process_args(pid)
+    return bool(args and args[0] == '/usr/bin/gamescope' and
+                '--socket=waydroid-mangoapp' in args)
+
+
+def has_weston(pid):
+    # Gamescope normally launches Weston through gamescopereaper, not directly.
+    pending, visited = [pid], set()
+    while pending and len(visited) < 256:
+        current = pending.pop()
+        if current in visited:
+            continue
+        visited.add(current)
+        args = process_args(current)
+        if args and Path(args[0]).name == 'weston' and '--socket=waydroid-mangoapp' in args:
+            return True
+        try:
+            # Gamescope spawns its reaper from a worker thread. Linux's children
+            # file lists only children of that particular thread, not the group.
+            for task in (Path('/proc') / str(current) / 'task').iterdir():
+                try:
+                    pending.extend(int(child) for child in (task / 'children').read_text().split())
+                except OSError:
+                    continue
+        except OSError:
+            pass
+    return False
+
+
+def process_age(pid):
+    try:
+        # Fields after ')' begin at stat field 3; starttime is field 22.
+        fields = (Path('/proc') / str(pid) / 'stat').read_text().rsplit(')', 1)[1].split()
+        uptime = float(Path('/proc/uptime').read_text().split()[0])
+        return uptime - int(fields[19]) / os.sysconf('SC_CLK_TCK')
+    except (OSError, ValueError, IndexError):
+        return float('inf')
+
+
+def stop_owned_gamescope(pid):
+    for sig, wait in ((signal.SIGTERM, 5), (signal.SIGKILL, 3)):
+        if not owned_gamescope(pid):
+            return
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            return
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline:
+            if not owned_gamescope(pid):
+                return
+            time.sleep(.1)
 
 home = Path.home()
 runtime = Path(os.environ.get('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}'))
@@ -16,13 +83,28 @@ except BlockingIOError:
     try:
         lock.seek(0)
         pid = int(lock.read().strip())
-        windows = json.loads(subprocess.check_output(['niri', 'msg', '-j', 'windows']))
-        window = next((w for w in windows if w.get('pid') == pid), None)
-        if window:
-            subprocess.run(['niri', 'msg', 'action', 'focus-window', '--id', str(window['id'])])
-    except (ValueError, OSError, subprocess.SubprocessError):
-        pass
-    sys.exit(0)
+        if owned_gamescope(pid) and (has_weston(pid) or process_age(pid) < 30):
+            windows = json.loads(subprocess.check_output(['niri', 'msg', '-j', 'windows']))
+            window = next((w for w in windows if w.get('pid') == pid), None)
+            if window:
+                subprocess.run(['niri', 'msg', 'action', 'focus-window', '--id', str(window['id'])])
+            sys.exit(0)
+        if not owned_gamescope(pid):
+            raise RuntimeError('HUD lock is held by an unknown process; refusing to replace it')
+        print(f'Recovering stale Waydroid Gamescope {pid}: no nested Weston', flush=True)
+        stop_owned_gamescope(pid)
+        deadline = time.monotonic() + 4
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError('Old HUD launcher did not release its lock')
+                time.sleep(.1)
+    except (ValueError, OSError, subprocess.SubprocessError, RuntimeError) as error:
+        print(f'Cannot start Waydroid HUD: {error}', file=sys.stderr, flush=True)
+        sys.exit(1)
 
 # A running Android compositor cannot be moved between Wayland sockets.
 status = subprocess.check_output(['/usr/bin/waydroid', 'status'], text=True)
@@ -56,4 +138,15 @@ with (logdir / 'launch.log').open('w') as log:
     lock.truncate()
     lock.write(str(process.pid))
     lock.flush()
-    sys.exit(process.wait())
+    # Gamescope can stay alive without any windows after its primary child exits.
+    # Reap that instance so closing Waydroid cannot block the next scheduled start.
+    started = time.monotonic()
+    missing = 0
+    while process.poll() is None:
+        time.sleep(2)
+        missing = 0 if has_weston(process.pid) else missing + 1
+        if time.monotonic() - started > 30 and missing >= 3:
+            print('Nested Weston exited; stopping the Waydroid Gamescope', flush=True)
+            stop_owned_gamescope(process.pid)
+            break
+    sys.exit(process.wait(timeout=5))
