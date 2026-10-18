@@ -111,3 +111,9 @@ sudo pacman -Rns arknights-waydroid-toolbox-bin
 - MuMu ABI 对接参考：MAA 项目的 `src/MaaCore/Controller/MumuExtras.cpp`（https://github.com/MaaAssistantArknights/MaaAssistantArknights）。
 - MAA 使用文档：https://docs.maa.plus/zh-cn/manual/connection.html
 - [`capture/README.md`](capture/README.md) 记录截图测试范围。
+
+## 已知的 vendor 镜像问题
+
+20260927 MAINLINE vendor 在开发机出现显示焦点/HWC 死锁，Android watchdog 在准备后重启框架，随后网络栈失效。症状是 Linux 准备曾成功，而 MAA 到点报连接失败。与上游 https://github.com/waydroid/waydroid/issues/2436 的阻塞栈一致；开发机只回退官方 20260428 MAINLINE vendor 进行验证，未替换 system 或删除用户数据。不要在不了解兼容性时自动回退其他设备；更新镜像前核对上游进展并备份。
+
+启动成功仅表示当时连接正常，不表示之后 MAA 游戏任务完成。排查时要同时查看 Android watchdog/ANR、MAA 日志和 systemd 日志，并覆盖后台等待与窗口焦点切换。

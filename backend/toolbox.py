@@ -304,7 +304,7 @@ def scheduler_units(config, prefs, executable=None):
         hour, minute = item['prepare'].split(':')
         result[base + '.service'] = (
             '[Unit]\nDescription=Prepare Waydroid and MAA before ' + item['time'] + '\n'
-            '\n[Service]\nType=oneshot\nTimeoutStartSec=420\n'
+            '\n[Service]\nType=oneshot\nTimeoutStartSec=480\n'
             'ExecStart=/usr/bin/python3 "' + executable.replace('"', '\\"') + '" prepare --slot ' + str(item['id']) + '\n')
         result[base + '.timer'] = (
             '[Unit]\nDescription=Waydroid/MAA preparation for ' + item['time'] + '\n'
@@ -424,17 +424,21 @@ def prepare(slot_id, dry_run=False):
                 if time.monotonic() >= deadline:
                     raise RuntimeError('MAA 启动超时，请查看 maa.log')
                 time.sleep(1)
-        deadline = time.monotonic() + 60
+        # Android may report boot_completed before adbd finishes reconnecting
+        # a previously running Windows server, especially after a vendor change.
+        deadline = time.monotonic() + 120
+        adb_error = 'device 尚未就绪'
         while True:
             try:
                 run(['wine', str(adb), 'connect', address], timeout=20, env=env)
                 device = run(['wine', str(adb), '-s', address, 'get-state'], timeout=10, env=env)
                 if device == 'device':
                     break
-            except (subprocess.TimeoutExpired, RuntimeError):
-                pass
+                adb_error = device or 'ADB 返回空状态'
+            except (subprocess.TimeoutExpired, RuntimeError) as error:
+                adb_error = str(error)
             if time.monotonic() >= deadline:
-                raise RuntimeError('ADB 未就绪或尚未授权，请查看 MAA 连接设置')
+                raise RuntimeError('ADB 未就绪或尚未授权：' + adb_error)
             time.sleep(2)
         touch_ready = warm_touch(adb, address, env) if cold_maa else True
         result = {'message': f'已为 {item["time"]} 准备好 Waydroid 与 MAA；任务由 MAA 到点执行', 'slot': item}
