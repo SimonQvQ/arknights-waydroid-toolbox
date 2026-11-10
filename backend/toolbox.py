@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import select
 import shutil
+import signal
 import socket
 import statistics
 import struct
@@ -90,17 +91,74 @@ def niri_windows():
         return []
 
 
-def maa_running():
-    # Wine windows may report the Xwayland PID, so inspect this user's processes.
-    for proc in Path('/proc').iterdir():
+def maa_running(root='/proc'):
+    """True while MAA is up, including the Wine bootstrap phase.
+
+    Wine reports the process as `wine` until MAA.exe itself is loaded, and on a
+    cold prefix `wineboot --init` can hold that name for well over a minute, so
+    comm alone is not enough. Callers that shell out to MAA names are filtered
+    out by requiring a Wine-ish comm, which also stops this scan from matching
+    the invoking shell's own command line.
+    """
+    for proc in Path(root).iterdir():
         if not proc.name.isdigit():
             continue
         try:
-            if proc.stat().st_uid == os.getuid() and (proc / 'comm').read_text().strip() == 'MAA.exe':
+            if proc.stat().st_uid != os.getuid():
+                continue
+            comm = (proc / 'comm').read_text().strip()
+            if comm.lower().startswith('maa.exe'):
+                return True
+            if not comm.lower().startswith('wine'):
+                continue
+            args = (proc / 'cmdline').read_bytes().split(b'\0')
+            if any(arg.replace(b'\\', b'/').lower().endswith(b'/maa.exe') for arg in args):
                 return True
         except OSError:
             pass
     return False
+
+
+def display_stack(root='/proc'):
+    """(pid, comm, argv) for this user's waydroid display processes."""
+    found = []
+    for proc in Path(root).iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            if proc.stat().st_uid != os.getuid():
+                continue
+            comm = (proc / 'comm').read_text().strip()
+            # Comm is truncated to 15 chars and gamescope reports as
+            # `gamescope-wl`, so match on the stem rather than the exact name.
+            if not re.match(r'^(gamescope|weston|Xwayland)', comm):
+                continue
+            args = [x.decode('utf-8', 'replace') for x in
+                    (proc / 'cmdline').read_bytes().split(b'\0') if x]
+            found.append((int(proc.name), comm, args))
+        except OSError:
+            pass
+    return found
+
+
+def stale_display_pids(root='/proc'):
+    """PIDs of HUD-spawned display processes that no longer form a valid stack.
+
+    A gamescope left behind by a crashed Weston holds the HUD lock and leaves
+    `waydroid-mangoapp` half-open, which makes the next launch die with
+    "xdg_surface error 3". Anything HUD-owned without its partner is residue.
+    """
+    stack = display_stack(root)
+    gamescopes = [pid for pid, comm, args in stack
+                  if comm.startswith('gamescope')
+                  and ('--mangoapp' in args or 'mangoapp' in ' '.join(args))]
+    wests = [pid for pid, comm, args in stack
+             if comm == 'weston' and '--socket=waydroid-mangoapp' in args]
+    if not wests:
+        return gamescopes          # orphaned gamescope: its Weston is gone
+    if not gamescopes:
+        return wests               # nested Weston outlived its parent
+    return []
 
 
 def waydroid_status():
@@ -528,20 +586,47 @@ def prepare(slot_id, dry_run=False):
                 time.sleep(1)
             else:
                 raise RuntimeError('无法停止占用其他显示会话的 Waydroid，请手动关闭后重试')
-        game_start(focus=False)
-        deadline = time.monotonic() + 200
-        while time.monotonic() < deadline:
-            try:
-                status = waydroid_status()
-                if status.get('Container') == 'RUNNING' and status.get('IP address') not in (None, '', 'UNKNOWN'):
-                    boot = run(['waydroid', 'prop', 'get', 'sys.boot_completed'], timeout=5, check=False)
-                    if boot == '1':
+        # A gamescope that outlived its Weston keeps the HUD's start lock and
+        # leaves the nested socket in a half-open state; the next launch then
+        # dies with "xdg_surface error 3: must ack the initial configure".
+        # Clearing it before launching is what makes the retry below reliable.
+        def clear_stale_stack():
+            for pid in stale_display_pids():
+                for sig in (signal.SIGTERM, signal.SIGKILL):
+                    try:
+                        os.kill(pid, sig)
+                    except OSError:
                         break
-            except subprocess.TimeoutExpired:
-                # Binder/property calls can stall briefly during Android boot.
-                pass
-            time.sleep(2)
-        else:
+                    time.sleep(1)
+                    if not Path(f'/proc/{pid}').exists():
+                        break
+            time.sleep(1)
+
+        clear_stale_stack()
+        started = False
+        for attempt in (1, 2):
+            game_start(focus=False)
+            deadline = time.monotonic() + 200
+            while time.monotonic() < deadline:
+                try:
+                    status = waydroid_status()
+                    if status.get('Container') == 'RUNNING' and status.get('IP address') not in (None, '', 'UNKNOWN'):
+                        boot = run(['waydroid', 'prop', 'get', 'sys.boot_completed'], timeout=5, check=False)
+                        if boot == '1':
+                            started = True
+                            break
+                except subprocess.TimeoutExpired:
+                    # Binder/property calls can stall briefly during Android boot.
+                    pass
+                time.sleep(2)
+            if started:
+                break
+            if attempt == 1:
+                # Weston died mid-session (its socket stays half-open), so the
+                # second attempt needs the residue cleaned, not just a relaunch.
+                run(['waydroid', 'session', 'stop'], timeout=60, check=False)
+                clear_stale_stack()
+        if not started:
             raise RuntimeError('Waydroid 启动超时，请查看启动日志')
         address = status['IP address'] + ':5555'
         env = desktop_env()
@@ -580,11 +665,14 @@ def prepare(slot_id, dry_run=False):
         # preparation cgroup (which would take Wine/ADB down when it finishes).
         if cold_maa:
             maa_start(focus=False)
-            deadline = time.monotonic() + 60
+            # A cold Wine prefix runs `wineboot --init` first, which has been
+            # measured at 100+ s on this machine; the old 60 s cap aborted the
+            # whole preparation while MAA was still legitimately starting.
+            deadline = time.monotonic() + 240
             while not maa_running():
                 if time.monotonic() >= deadline:
                     raise RuntimeError('MAA 启动超时，请查看 maa.log')
-                time.sleep(1)
+                time.sleep(2)
         # Android may report boot_completed before adbd finishes reconnecting
         # a previously running Windows server, especially after a vendor change.
         deadline = time.monotonic() + 120

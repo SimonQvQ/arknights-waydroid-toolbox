@@ -209,5 +209,87 @@ class WatcherTests(unittest.TestCase):
         self.assertTrue(done)
 
 
+class ProcessTests(unittest.TestCase):
+    def _fake_proc(self, root, pid, comm, argv):
+        directory = root / str(pid)
+        directory.mkdir(parents=True)
+        (directory / 'comm').write_text(comm + '\n')
+        (directory / 'cmdline').write_bytes(b'\0'.join(a.encode() for a in argv) + b'\0')
+
+    def test_python_process_mentioning_maa_is_not_maa(self):
+        """`pgrep -f MAA.dll` matched the invoking shell and lied; the scan must not.
+
+        A plain python process whose argv names MAA.exe used to be enough to
+        make the toolbox think MAA was already running.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._fake_proc(root, 101, 'python3', ['/usr/bin/python3', 'toolbox.py', 'MAA.exe'])
+            self._fake_proc(root, 102, 'bash', ['bash', '-c', 'pgrep -f MAA.exe'])
+            with patch.object(toolbox.os, 'getuid', return_value=root.stat().st_uid):
+                self.assertFalse(toolbox.maa_running(str(root)))
+
+    def test_wine_bootstrap_counts_as_running(self):
+        """On a cold prefix MAA runs inside wine before MAA.exe gets its own comm."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._fake_proc(root, 201, 'wine',
+                            ['/usr/lib/wine/x86_64-unix/wine',
+                             '/home/x/.local/share/maa-wine/app/MAA.exe'])
+            with patch.object(toolbox.os, 'getuid', return_value=root.stat().st_uid):
+                self.assertTrue(toolbox.maa_running(str(root)))
+
+    def test_native_maa_exe_comm_counts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._fake_proc(root, 301, 'MAA.exe', ['MAA.exe'])
+            with patch.object(toolbox.os, 'getuid', return_value=root.stat().st_uid):
+                self.assertTrue(toolbox.maa_running(str(root)))
+
+
+class DisplayStackTests(unittest.TestCase):
+    """The HUD's gamescope+weston pair; a half-dead pair breaks the next start."""
+
+    def _proc(self, root, pid, comm, argv):
+        directory = root / str(pid)
+        directory.mkdir(parents=True)
+        (directory / 'comm').write_text(comm + '\n')
+        (directory / 'cmdline').write_bytes(b'\0'.join(a.encode() for a in argv) + b'\0')
+
+    def _scan(self, root):
+        with patch.object(toolbox.os, 'getuid', return_value=root.stat().st_uid):
+            return toolbox.stale_display_pids(str(root))
+
+    def test_orphaned_gamescope_is_stale(self):
+        """Weston died first; the surviving gamescope holds the start lock."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._proc(root, 10, 'gamescope-wl',
+                       ['/usr/bin/gamescope', '--backend', 'sdl', '--mangoapp', '--', 'weston'])
+            self.assertEqual(self._scan(root), [10])
+
+    def test_orphaned_weston_is_stale(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._proc(root, 20, 'weston',
+                       ['/usr/bin/weston', '--backend=x11', '--socket=waydroid-mangoapp'])
+            self.assertEqual(self._scan(root), [20])
+
+    def test_healthy_pair_is_left_alone(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._proc(root, 30, 'gamescope-wl', ['/usr/bin/gamescope', '--mangoapp'])
+            self._proc(root, 31, 'weston',
+                       ['/usr/bin/weston', '--socket=waydroid-mangoapp'])
+            self.assertEqual(self._scan(root), [])
+
+    def test_unrelated_weston_is_ignored(self):
+        """A desktop Weston on another socket must never be killed."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._proc(root, 40, 'weston', ['/usr/bin/weston', '--socket=wayland-1'])
+            self.assertEqual(self._scan(root), [])
+
+
 if __name__ == '__main__':
     unittest.main()
