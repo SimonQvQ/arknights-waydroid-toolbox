@@ -132,7 +132,14 @@ command = [
 ]
 logdir = home / '.local/state/waydroid-mangoapp'
 logdir.mkdir(parents=True, exist_ok=True)
-with (logdir / 'launch.log').open('w') as log:
+logpath = logdir / 'launch.log'
+# Append instead of truncating: overwriting the file destroyed the evidence for
+# a Weston crash that only reproduces under a stale display stack.
+if logpath.exists() and logpath.stat().st_size > 2_000_000:
+    logpath.replace(logdir / 'launch.log.1')
+with logpath.open('a') as log:
+    log.write(f'\n=== {time.strftime("%Y-%m-%d %H:%M:%S")} launching HUD ===\n')
+    log.flush()
     process = subprocess.Popen(command, env=env, cwd=home, stdout=log, stderr=subprocess.STDOUT)
     lock.seek(0)
     lock.truncate()
