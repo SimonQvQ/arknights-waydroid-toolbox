@@ -257,19 +257,113 @@ def warm_touch(adb, address, env):
         run(base + ['shell', 'rm', '-f', remote], timeout=10, check=False, env=env)
 
 
-def close_maa():
+def close_maa(timeout=20.0):
+    """Shut MAA down. Prefer a graceful window close, but never leave a
+    headless MAA behind: an announcement or guide dialog can hide the main
+    window entirely, which used to make this raise instead of closing."""
     if not maa_running():
         return
     matches = [w for w in niri_windows() if w.get('app_id', '').lower() == 'maa.exe']
-    if not matches:
-        raise RuntimeError('MAA 正在后台运行，请先退出 MAA 再切换截图模式')
     for w in matches:
-        run(['niri', 'msg', 'action', 'close-window', '--id', str(w['id'])])
-    for _ in range(80):
+        run(['niri', 'msg', 'action', 'close-window', '--id', str(w['id'])], check=False)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
         if not maa_running():
             return
-        time.sleep(.1)
-    raise RuntimeError('MAA 尚未退出；请处理它的关闭提示后重试')
+        time.sleep(.2)
+    # Modal dialogs such as MAA's announcement viewer survive a window close.
+    run(['pkill', '-TERM', '-f', 'MAA[.]exe'], check=False)
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if not maa_running():
+            return
+        time.sleep(.2)
+    run(['pkill', '-KILL', '-f', 'MAA[.]exe'], check=False)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if not maa_running():
+            return
+        time.sleep(.2)
+    raise RuntimeError('MAA 未能在超时前退出')
+
+
+def notify(title, body, urgency='normal'):
+    """Desktop notification; failure must never break a scheduled run."""
+    run(['notify-send', '-a', '明日方舟 MAA', '-u', urgency,
+         '-i', 'applications-games', title, body], timeout=10, check=False)
+
+
+def remind(slot_id):
+    prefs = settings()
+    _, config = maa_config()
+    item = next((x for x in slots(config, int(prefs['lead_minutes'])) if x['id'] == slot_id), None)
+    if not item or not item['enabled']:
+        return {'message': '该 MAA 定时已禁用，跳过提醒'}
+    notify('MAA 任务 1 分钟后开始',
+           f'定时 {item["time"]}，即将自动启动明日方舟与 MAA')
+    return {'message': f'已提醒：{item["time"]} 的任务将在 1 分钟后开始'}
+
+
+def finish_session(reason='任务完成'):
+    """Close MAA, then the Waydroid session, once the task chain is over."""
+    maa_closed, waydroid_closed = False, False
+    try:
+        close_maa(timeout=30)
+        maa_closed = True
+    except (RuntimeError, subprocess.TimeoutExpired):
+        pass
+    run(['waydroid', 'session', 'stop'], timeout=90, check=False)
+    waydroid_closed = waydroid_status().get('Session') not in ('RUNNING', 'FROZEN')
+    result = {'message': f'{reason}：已关闭 Waydroid 与 MAA', 'maa_closed': maa_closed,
+              'waydroid_closed': waydroid_closed}
+    notify('明日方舟任务已结束',
+           f'{reason}\nWaydroid 会话已关闭' + ('，MAA 已退出' if maa_closed else '，MAA 仍在运行'))
+    try:
+        atomic_json(STATE / 'last-finish.json',
+                    dict(result, reason=reason, at=dt.datetime.now().isoformat(timespec='seconds')))
+    except OSError:
+        pass
+    return result
+
+
+# MAA ends a queued run with "Idle: true to true (called from ProcTaskChainMsg)".
+# A stop requested mid-run reports SetStopped instead, so this only fires when
+# the queue actually drained.
+TASK_START = re.compile(r'BeginRun: owner="TaskQueue" \(called from LinkStartWithTasks\)')
+TASK_END = re.compile(r'Idle: true to true \(called from ProcTaskChainMsg\)')
+
+
+def watch():
+    """Follow MAA's log and close the session when a scheduled run completes."""
+    prefs = settings()
+    log = Path(prefs['maa_dir']) / 'debug/gui.log'
+    running, stream, inode = False, None, 0
+    try:
+        while True:
+            try:
+                info = log.stat()
+            except OSError:
+                time.sleep(2)
+                continue
+            if stream is None or info.st_ino != inode:
+                if stream is not None:
+                    stream.close()
+                # Start at EOF so replays of old runs never close a live session.
+                stream = log.open('r', errors='replace')
+                stream.seek(0, os.SEEK_END)
+                inode = info.st_ino
+            if stream.tell() > info.st_size:
+                stream.seek(0)
+            for line in stream.read().splitlines():
+                if TASK_START.search(line):
+                    running = True
+                elif TASK_END.search(line) and running:
+                    running = False
+                    finish_session('MAA 任务完成')
+            time.sleep(2)
+    finally:
+        if stream is not None:
+            stream.close()
 
 
 def capture_mode(enabled):
@@ -311,6 +405,20 @@ def scheduler_units(config, prefs, executable=None):
             '\n[Timer]\nOnCalendar=*-*-* ' + hour + ':' + minute + ':00\n'
             'AccuracySec=1s\nPersistent=false\nUnit=' + base + '.service\n'
             '\n[Install]\nWantedBy=timers.target\n')
+        # One-minute warning, counted back from the slot's start time (not from
+        # the earlier preparation time).
+        start_hour, start_minute = (int(x) for x in item['time'].split(':'))
+        remind_at = (dt.datetime.combine(dt.date.today(), dt.time(start_hour, start_minute))
+                     - dt.timedelta(minutes=1))
+        result[base + '-remind.service'] = (
+            '[Unit]\nDescription=Remind one minute before ' + item['time'] + '\n'
+            '\n[Service]\nType=oneshot\n'
+            'ExecStart=/usr/bin/python3 "' + executable.replace('"', '\\"') + '" remind --slot ' + str(item['id']) + '\n')
+        result[base + '-remind.timer'] = (
+            '[Unit]\nDescription=One-minute warning for ' + item['time'] + '\n'
+            '\n[Timer]\nOnCalendar=*-*-* ' + remind_at.strftime('%H:%M') + ':00\n'
+            'AccuracySec=1s\nPersistent=false\nUnit=' + base + '-remind.service\n'
+            '\n[Install]\nWantedBy=timers.target\n')
     return result
 
 
@@ -324,7 +432,7 @@ def sync_schedule():
         changed = []
         removed = False
         for old in UNITS.glob(f'{PREFIX}slot-*.*'):
-            if not re.fullmatch(r'arknights-toolbox-slot-[0-7]\.(timer|service)', old.name):
+            if not re.fullmatch(r'arknights-toolbox-slot-[0-7](-remind)?\.(timer|service)', old.name):
                 continue
             if old.name not in desired:
                 if old.suffix == '.timer':
@@ -363,9 +471,18 @@ def scheduler_enable(enabled):
     (UNITS / f'{PREFIX}sync.path').write_text(
         '[Unit]\nDescription=Watch MAA schedule changes\n\n[Path]\nPathChanged=' + str(path) + '\n'
         'Unit=' + PREFIX + 'sync.service\n\n[Install]\nWantedBy=default.target\n')
+    # Long-lived follower that tears the session down once MAA's queue drains.
+    (UNITS / f'{PREFIX}watcher.service').write_text(
+        '[Unit]\nDescription=Close Waydroid and MAA when a scheduled task finishes\n'
+        'After=graphical-session.target\n'
+        '\n[Service]\nType=simple\n'
+        'ExecStart=/usr/bin/python3 "' + backend + '" watch\n'
+        'Restart=always\nRestartSec=5\n'
+        '\n[Install]\nWantedBy=default.target\n')
     run(['systemctl', '--user', 'daemon-reload'])
     verb = 'enable' if enabled else 'disable'
     run(['systemctl', '--user', verb, '--now', f'{PREFIX}sync.path'])
+    run(['systemctl', '--user', verb, '--now', f'{PREFIX}watcher.service'])
     # The oneshot is enabled for login, but starting it here would race our own sync.
     run(['systemctl', '--user', verb, f'{PREFIX}sync.service'])
     return sync_schedule()
@@ -386,8 +503,20 @@ def prepare(slot_id, dry_run=False):
         except BlockingIOError:
             return {'message': '另一个定时准备正在进行'}
         status = waydroid_status()
-        if status.get('Session') == 'RUNNING' and status.get('Wayland display') != 'waydroid-mangoapp':
-            raise RuntimeError('Waydroid 在其他显示会话中运行，未自动中断它')
+        # A running Android compositor cannot be moved between Wayland sockets,
+        # and the MuMu capture API only works when Weston owns the session. A
+        # stale session on Niri's socket (or one left behind by a previous
+        # manual `waydroid session start`) therefore has to be recycled instead
+        # of failing the whole scheduled preparation.
+        if status.get('Session') in ('RUNNING', 'FROZEN') and status.get('Wayland display') != 'waydroid-mangoapp':
+            run(['waydroid', 'session', 'stop'], timeout=60, check=False)
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                if waydroid_status().get('Session') not in ('RUNNING', 'FROZEN'):
+                    break
+                time.sleep(1)
+            else:
+                raise RuntimeError('无法停止占用其他显示会话的 Waydroid，请手动关闭后重试')
         game_start(focus=False)
         deadline = time.monotonic() + 200
         while time.monotonic() < deadline:
@@ -409,15 +538,36 @@ def prepare(slot_id, dry_run=False):
                    WINEESYNC='0', WINEFSYNC='0', WINEDLLOVERRIDES='winemenubuilder=')
         adb = Path(prefs['maa_dir']) / 'platform-tools/adb.exe'
         cold_maa = not maa_running()
+        # Repair the connection profile on every run, not just cold starts. MAA
+        # rewrites EnableBridgeConnection and TouchMode while running (its
+        # first-run guide and the MuMu keep-alive probe both do this), and a
+        # stale profile is exactly what turns into "触控模式不可用".
+        #
+        # The file is rewritten unconditionally so the next launch is correct,
+        # but a running MAA is left alone: killing it would abort whatever task
+        # queue the user started by hand.
+        path, config = maa_config()
+        changed = False
+        for values in config.get('Configurations', {}).values():
+            connection = values.get('Gui', {}).get('ConnectSettings')
+            if connection is None:
+                continue
+            extra = connection.setdefault('Extras', {}).setdefault('MuMuEmulator12', {})
+            for holder, fields in (
+                    (connection, {'Address': address, 'Config': 'MuMuEmulator12',
+                                  'TouchMode': 'MumuExtras', 'EnableAdbLite': True}),
+                    (extra, {'IsEnabled': True, 'EnableBridgeConnection': True,
+                             'EmulatorPath': 'Z:' + prefs['sdk_dir'].replace('/', '\\'),
+                             'InstanceIndex': 0})):
+                for key, value in fields.items():
+                    if holder.get(key) != value:
+                        holder[key] = value
+                        changed = True
+        if changed:
+            atomic_json(path, config)
         # Bootstrap Wine in MAA's independent unit, not in this short-lived
         # preparation cgroup (which would take Wine/ADB down when it finishes).
         if cold_maa:
-            path, config = maa_config()
-            for values in config.get('Configurations', {}).values():
-                connection = values.get('Gui', {}).get('ConnectSettings')
-                if connection is not None:
-                    connection['Address'] = address
-            atomic_json(path, config)
             maa_start(focus=False)
             deadline = time.monotonic() + 60
             while not maa_running():
@@ -479,16 +629,25 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument('action', choices=['status', 'preview', 'benchmark', 'game-start', 'maa-start',
                                      'game-stop', 'capture-on', 'capture-off', 'scheduler-on',
-                                     'scheduler-off', 'sync', 'prepare', 'logs', 'config-folder'])
+                                     'scheduler-off', 'sync', 'prepare', 'remind', 'watch',
+                                     'logs', 'config-folder'])
     p.add_argument('--slot', type=int, default=0)
     p.add_argument('--dry-run', action='store_true')
     a = p.parse_args()
+    if a.action == 'watch':
+        # Long-running: owns the session teardown for the whole login session.
+        try:
+            watch()
+        except KeyboardInterrupt:
+            pass
+        return
     try:
         actions = {'status': status, 'preview': preview, 'benchmark': benchmark,
                    'game-start': game_start, 'maa-start': maa_start,
                    'capture-on': lambda: capture_mode(True), 'capture-off': lambda: capture_mode(False),
                    'scheduler-on': lambda: scheduler_enable(True), 'scheduler-off': lambda: scheduler_enable(False),
                    'sync': sync_schedule, 'prepare': lambda: prepare(a.slot, a.dry_run),
+                   'remind': lambda: remind(a.slot),
                    'game-stop': lambda: {'message': run(['waydroid', 'session', 'stop'], timeout=40) or 'Waydroid 已停止'},
                    'logs': lambda: {'text': run(['journalctl', '--user', '-u', PREFIX+'*', '-u', 'waydroid-mumu-capture.service', '-n', '60', '--no-pager'], check=False)},
                    'config-folder': lambda: {'unit': launch(['xdg-open', str(Path(settings()['maa_dir'])/'config')], 'folder')}}

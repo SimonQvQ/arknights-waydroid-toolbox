@@ -10,16 +10,21 @@ Flutter Linux 桌面工具：整合《明日方舟》Waydroid HUD 启动器、MA
 - 启动现有 Lutris 中的 Windows MAA，保留独立 Wine 前缀。
 - 截图增强开关、预览、20 次接口测速、普通 ADB 回退和运行日志。
 - 读取 MAA `config/gui.new.json` 的 `Timers.List`，生成用户级 systemd 定时器，并监听配置保存后自动同步。
+- 每个定时可选：开始前 1 分钟发送桌面通知，任务完成后自动关闭 Waydroid 会话和 MAA。
 
 ## 关闭窗口后，定时还有效吗？
 
 **有效。** Linux 在 MAA 定时前 5 分钟按需启动 Waydroid、连接 ADB 并启动 MAA；已有会话不会被定时准备重启。到点由 **MAA 自己** 执行其配置好的任务，工具箱不复制任务队列，也不直接调用任务执行 API。
 
+准备阶段若发现 Waydroid 跑在错误的显示会话上（例如手动 `waydroid session start` 落在 Niri 的 `wayland-1`），会先停止该会话再通过 HUD 重新拉起 `waydroid-mangoapp`，因为 MuMu 截图接口只在 Weston 持有会话时可用，且运行中的 Android 合成器无法在 Wayland socket 之间搬迁。每次准备也会校正 MAA 连接配置里的 `Config`/`TouchMode`/`EnableBridgeConnection`——MAA 的首次引导和 MuMu 保活探测会把这些字段改坏，表现为「触控模式不可用」。正在运行的 MAA 不会被重启，改动在下次启动生效。
+
+启用「任务完成后自动关闭」后，常驻的 `arknights-toolbox-watcher.service` 跟随 MAA 日志：出现 `BeginRun` 后一旦队列排空（`Idle: true to true (called from ProcTaskChainMsg)`），就关闭 MAA 并执行 `waydroid session stop`。手动中止的任务不会触发，避免误关。
+
 启动的图形应用使用独立的 systemd 用户服务，定时准备结束后继续运行；HUD 启动器会回收失去 Weston 的残留 Gamescope，避免启动锁阻塞。Android 与 Wine 冷启动的短暂查询失败会自动重试。
 
 工具箱窗口不必常驻；关闭窗口后也不会立刻重新弹出。电脑需要已登录图形桌面并保持唤醒；不自动开机或唤醒睡眠，不补跑错过的时间。MAA 的半选单次定时仍由 MAA 管理，不转换成每日重复任务。
 
-定时单元为 `arknights-toolbox-slot-0.timer` 等，仅管理自己的 0–7 号槽位。配置读取失败时保留已有定时器。准备失败可在日志页面查看，不能据此保证游戏任务成功完成。
+定时单元为 `arknights-toolbox-slot-0.timer` 等，仅管理自己的 0–7 号槽位；提醒单元为 `arknights-toolbox-slot-0-remind.timer`。配置读取失败时保留已有定时器。准备失败可在日志页面查看，不能据此保证游戏任务成功完成。
 
 ## 构建和安装
 
@@ -75,7 +80,7 @@ ARKNIGHTS_TOOLBOX_BACKEND="$PWD/backend/toolbox.py" flutter run -d linux
 
 其中 `lutris_game_id` 必须是你自己 MAA 项目的 ID。MAA 至少启动过一次，生成 `config/gui.new.json`。在 MAA 中设置 Windows `adb.exe` 路径和 Waydroid 实际 IP:5555，完成 Android ADB 授权，使用 **MaaTouch** 和 ADB Lite。不要开启 MuMu 触控增强。
 
-先手动确认 HUD、MAA 和连接测试成功，再在工具箱启用截图增强及 Linux 定时。HUD 启动脚本首次启动会停止已有 Waydroid 会话以切换显示环境；定时准备检测到其他 Waydroid 显示会话时会报错并保留该会话。
+先手动确认 HUD、MAA 和连接测试成功，再在工具箱启用截图增强及 Linux 定时。HUD 启动脚本首次启动会停止已有 Waydroid 会话以切换显示环境；定时准备检测到其他 Waydroid 显示会话时会先停止它，再通过 HUD 重新拉起 `waydroid-mangoapp`。
 
 ## 截图兼容层的原理和范围
 
