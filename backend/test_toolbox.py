@@ -181,5 +181,33 @@ class RecoveryTests(unittest.TestCase):
                         'close_maa must fall back to pkill when no window is listed')
 
 
+class WatcherTests(unittest.TestCase):
+    START = '[INF][TaskQueue] BeginRun: owner="TaskQueue" (called from LinkStartWithTasks)'
+    END = '[INF][TaskQueue] Idle: true to true (called from ProcTaskChainMsg)'
+
+    def test_drain_after_start_finishes_once(self):
+        state, done = toolbox.scan_log([self.START, self.END], False)
+        self.assertFalse(state)
+        self.assertTrue(done)
+
+    def test_end_without_a_start_is_ignored(self):
+        """Replayed history or a stray idle line must not tear down a session."""
+        state, done = toolbox.scan_log([self.END], False)
+        self.assertFalse(state)
+        self.assertFalse(done)
+
+    def test_manual_stop_does_not_finish(self):
+        state, done = toolbox.scan_log(
+            [self.START, '[INF][TaskQueue] SetStopped: true'], False)
+        self.assertTrue(state, 'a stopped run leaves the queue non-idle')
+        self.assertFalse(done)
+
+    def test_each_drain_reports_separately(self):
+        state, done = toolbox.scan_log([self.START, self.END], False)
+        self.assertTrue(done)
+        state, done = toolbox.scan_log([self.START, self.END], state)
+        self.assertTrue(done)
+
+
 if __name__ == '__main__':
     unittest.main()

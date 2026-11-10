@@ -333,17 +333,31 @@ TASK_START = re.compile(r'BeginRun: owner="TaskQueue" \(called from LinkStartWit
 TASK_END = re.compile(r'Idle: true to true \(called from ProcTaskChainMsg\)')
 
 
-def watch():
+def scan_log(lines, running):
+    """Fold log lines into the run state; report whether the queue just drained.
+
+    Split out of watch() so the state machine can be tested without a daemon.
+    """
+    finished = False
+    for line in lines:
+        if TASK_START.search(line):
+            running = True
+        elif TASK_END.search(line) and running:
+            running = False
+            finished = True
+    return running, finished
+
+
+def watch(poll=2.0):
     """Follow MAA's log and close the session when a scheduled run completes."""
-    prefs = settings()
-    log = Path(prefs['maa_dir']) / 'debug/gui.log'
+    log = Path(settings()['maa_dir']) / 'debug/gui.log'
     running, stream, inode = False, None, 0
     try:
         while True:
             try:
                 info = log.stat()
             except OSError:
-                time.sleep(2)
+                time.sleep(poll)
                 continue
             if stream is None or info.st_ino != inode:
                 if stream is not None:
@@ -354,13 +368,10 @@ def watch():
                 inode = info.st_ino
             if stream.tell() > info.st_size:
                 stream.seek(0)
-            for line in stream.read().splitlines():
-                if TASK_START.search(line):
-                    running = True
-                elif TASK_END.search(line) and running:
-                    running = False
-                    finish_session('MAA 任务完成')
-            time.sleep(2)
+            running, finished = scan_log(stream.read().splitlines(), running)
+            if finished:
+                finish_session('MAA 任务完成')
+            time.sleep(poll)
     finally:
         if stream is not None:
             stream.close()
