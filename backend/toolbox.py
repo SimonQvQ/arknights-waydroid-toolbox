@@ -639,9 +639,10 @@ def prepare(slot_id, dry_run=False):
         # first-run guide and the MuMu keep-alive probe both do this), and a
         # stale profile is exactly what turns into "触控模式不可用".
         #
-        # The file is rewritten unconditionally so the next launch is correct,
-        # but a running MAA is left alone: killing it would abort whatever task
-        # queue the user started by hand.
+        # MumuExtras is correct now that the shim forwards input as well as
+        # capture: nemu_input_event_touch_down/up reach a persistent `adb shell`
+        # and inject real MotionEvents. It used to abort every task ~20 s in
+        # because the input exports returned failure.
         path, config = maa_config()
         changed = False
         for values in config.get('Configurations', {}).values():

@@ -160,6 +160,7 @@ class RecoveryTests(unittest.TestCase):
                 toolbox.prepare(0)
         connection = written['Configurations']['Default']['Gui']['ConnectSettings']
         self.assertEqual(connection['Config'], 'MuMuEmulator12')
+        # The shim now forwards input, so MuMuExtras is the mode MAA should use.
         self.assertEqual(connection['TouchMode'], 'MumuExtras')
         self.assertEqual(connection['Address'], '192.0.2.7:5555')
         self.assertTrue(connection['Extras']['MuMuEmulator12']['EnableBridgeConnection'])

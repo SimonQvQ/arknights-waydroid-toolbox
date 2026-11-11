@@ -49,15 +49,37 @@ int __cdecl nemu_capture_display(int handle,unsigned int display,int size,int *w
     if(request(size==0?'I':'C',&h,pixels,size)) return -1;
     *width=h.width; *height=h.height; return 0;
 }
-/* Screenshot-only adapter. MAA must keep using MaaTouch for all input. */
-int __cdecl nemu_input_text(int handle,const char *text) { (void)handle; (void)text; return -1; }
-int __cdecl nemu_input_event_touch_down(int handle,int display,int x,int y) {
-    (void)handle; (void)display; (void)x; (void)y; return -1;
+/* Send an input command. The payload travels in the header: x/y for touch
+ * events, the keysym in `bytes` for keys. Returns 0 when the server injected
+ * the event, -1 when the display stack is not reachable. */
+static int input_request(char command,uint32_t x,uint32_t y,uint32_t extra) {
+    int fd=socket(AF_UNIX,SOCK_STREAM|SOCK_CLOEXEC,0); if(fd<0) return -1;
+    struct timeval timeout={.tv_sec=1};
+    setsockopt(fd,SOL_SOCKET,SO_SNDTIMEO,&timeout,sizeof(timeout));
+    setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout));
+    struct sockaddr_un addr={.sun_family=AF_UNIX};
+    snprintf(addr.sun_path,sizeof(addr.sun_path),"/run/user/%lu/waydroid-mumu-capture.sock",(unsigned long)getuid());
+    CapHeader in={.magic=CAP_MAGIC,.width=x,.height=y,.bytes=extra},h;
+    int ok=connect(fd,(struct sockaddr*)&addr,sizeof(addr))==0 &&
+        send(fd,&command,1,MSG_NOSIGNAL)==1 &&
+        send(fd,&in,sizeof(in),MSG_NOSIGNAL)==(ssize_t)sizeof(in) &&
+        read_all(fd,&h,sizeof(h))==0 && h.magic==CAP_MAGIC && h.status==0;
+    close(fd); return ok?0:-1;
 }
-int __cdecl nemu_input_event_touch_up(int handle,int display) { (void)handle; (void)display; return -1; }
+int __cdecl nemu_input_text(int handle,const char *text) {
+    (void)handle; (void)text; return -1;
+}
+int __cdecl nemu_input_event_touch_down(int handle,int display,int x,int y) {
+    (void)display; return handle==1?input_request('D',(uint32_t)x,(uint32_t)y,0):-1;
+}
+int __cdecl nemu_input_event_touch_up(int handle,int display) {
+    (void)display; return handle==1?input_request('U',0,0,0):-1;
+}
 int __cdecl nemu_input_event_key_down(int handle,int display,int key) {
-    (void)handle; (void)display; (void)key; return -1;
+    (void)display; return handle==1?input_request('K',0,0,(uint32_t)key):-1;
 }
 int __cdecl nemu_input_event_key_up(int handle,int display,int key) {
-    (void)handle; (void)display; (void)key; return -1;
+    /* Android's `input keyevent` already delivers a complete press+release, so
+     * the down export does the work and this one only acknowledges it. */
+    (void)handle; (void)display; (void)key; return 0;
 }

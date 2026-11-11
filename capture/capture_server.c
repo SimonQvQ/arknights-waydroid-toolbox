@@ -50,6 +50,47 @@ static int send_all(int fd,const void *data,size_t n) {
     }
     return 0;
 }
+/* ---- Input injection ----------------------------------------------------
+ *
+ * MuMuExtras calls nemu_input_event_touch_down/up and the key/text exports for
+ * every tap. The original shim returned failure, which made MAA abort each
+ * task with "触控模式不可用". Android 13's `input` command can inject the same
+ * events, so the payload is forwarded to a long-lived `adb shell` instead of
+ * spawning a process per event (a fork+exec costs ~70 ms, which is far too
+ * slow for dragging and multi-finger gestures).
+ */
+static FILE *adb_shell = NULL;
+
+static int adb_open(void) {
+    if (adb_shell) return 0;
+    adb_shell = popen("/usr/bin/adb -s 127.0.0.1:5555 shell 2>/dev/null", "w");
+    return adb_shell ? 0 : -1;
+}
+
+static int adb_command(const char *arguments) {
+    if (adb_open()) return -1;
+    if (fprintf(adb_shell, "%s\n", arguments) < 0) { pclose(adb_shell); adb_shell = NULL; return -1; }
+    if (fflush(adb_shell) != 0) { pclose(adb_shell); adb_shell = NULL; return -1; }
+    return 0;
+}
+
+static int inject_input(char cmd, const CapHeader *in) {
+    char arguments[256];
+    int x = (int)in->width, y = (int)in->height;
+    switch (cmd) {
+    case 'D': snprintf(arguments, sizeof(arguments),
+                       "input motionevent DOWN %d %d", x, y); break;
+    case 'U': snprintf(arguments, sizeof(arguments),
+                       "input motionevent UP %d %d", x, y); break;
+    case 'M': snprintf(arguments, sizeof(arguments),
+                       "input motionevent MOVE %d %d", x, y); break;
+    case 'K': snprintf(arguments, sizeof(arguments),
+                       "input keyevent %u", in->bytes); break;
+    default: return -1;
+    }
+    return adb_command(arguments);
+}
+
 static int capture(Display *d,Window w,unsigned char *out) {
     xerror=0;
     XImage *im=XGetImage(d,w,0,0,CAP_WIDTH,CAP_HEIGHT,AllPlanes,ZPixmap);
@@ -92,7 +133,21 @@ int main(int argc,char **argv) {
         setsockopt(client,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout));
         struct ucred cred; socklen_t clen=sizeof(cred); char cmd=0;
         if(getsockopt(client,SOL_SOCKET,SO_PEERCRED,&cred,&clen) || cred.uid!=getuid() ||
-           recv(client,&cmd,1,MSG_WAITALL)!=1 || (cmd!='I' && cmd!='C')) { close(client); continue; }
+           recv(client,&cmd,1,MSG_WAITALL)!=1) { close(client); continue; }
+        if(cmd=='D' || cmd=='U' || cmd=='M' || cmd=='K' || cmd=='T') {
+            /* Input: the client sends a header carrying the payload. This
+             * process must not capture here, so it stays cheap enough for the
+             * sub-millisecond event stream MAA's MuMuExtras path produces. */
+            CapHeader in;
+            if(recv(client,&in,sizeof(in),MSG_WAITALL)!=(ssize_t)sizeof(in) || in.magic!=CAP_MAGIC) {
+                close(client); continue;
+            }
+            CapHeader h={.magic=CAP_MAGIC,.status=0,.width=CAP_WIDTH,.height=CAP_HEIGHT};
+            if(inject_input(cmd,&in)) h.status=1;
+            send_all(client,&h,sizeof(h));
+            close(client); continue;
+        }
+        if(cmd!='I' && cmd!='C') { close(client); continue; }
         CapHeader h={.magic=CAP_MAGIC,.status=1,.width=CAP_WIDTH,.height=CAP_HEIGHT};
         Window w=find_window(d,DefaultRootWindow(d),0);
         if(w) {
