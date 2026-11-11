@@ -50,9 +50,9 @@ int __cdecl nemu_capture_display(int handle,unsigned int display,int size,int *w
     *width=h.width; *height=h.height; return 0;
 }
 /* Send an input command. The payload travels in the header: x/y for touch
- * events, the keysym in `bytes` for keys. Returns 0 when the server injected
- * the event, -1 when the display stack is not reachable. */
-static int input_request(char command,uint32_t x,uint32_t y,uint32_t extra) {
+ * events, the keycode in `bytes` for keys, and an optional text string after
+ * it for nemu_input_text. Returns 0 when the server injected the event. */
+static int input_request(char command,uint32_t x,uint32_t y,uint32_t extra,const char *text) {
     int fd=socket(AF_UNIX,SOCK_STREAM|SOCK_CLOEXEC,0); if(fd<0) return -1;
     struct timeval timeout={.tv_sec=1};
     setsockopt(fd,SOL_SOCKET,SO_SNDTIMEO,&timeout,sizeof(timeout));
@@ -60,23 +60,55 @@ static int input_request(char command,uint32_t x,uint32_t y,uint32_t extra) {
     struct sockaddr_un addr={.sun_family=AF_UNIX};
     snprintf(addr.sun_path,sizeof(addr.sun_path),"/run/user/%lu/waydroid-mumu-capture.sock",(unsigned long)getuid());
     CapHeader in={.magic=CAP_MAGIC,.width=x,.height=y,.bytes=extra},h;
+    size_t length=text?strlen(text)+1:0;
     int ok=connect(fd,(struct sockaddr*)&addr,sizeof(addr))==0 &&
         send(fd,&command,1,MSG_NOSIGNAL)==1 &&
         send(fd,&in,sizeof(in),MSG_NOSIGNAL)==(ssize_t)sizeof(in) &&
+        (!length || send(fd,text,length,MSG_NOSIGNAL)==(ssize_t)length) &&
         read_all(fd,&h,sizeof(h))==0 && h.magic==CAP_MAGIC && h.status==0;
     close(fd); return ok?0:-1;
 }
-int __cdecl nemu_input_text(int handle,const char *text) {
-    (void)handle; (void)text; return -1;
+/* nemu_input_text(handle, length, utf8). MAA only sends short ASCII strings
+ * (operator search boxes). `adb shell input text` treats a space as an
+ * argument separator, so spaces become %s; anything outside printable ASCII is
+ * declined so the caller can fall back instead of typing the wrong thing. */
+int __cdecl nemu_input_text(int handle,int length,const char *text) {
+    if(handle!=1 || !text || length<=0 || length>200) return -1;
+    char buffer[512];
+    int written=0;
+    for(int i=0;i<length && written<200;i++) {
+        unsigned char c=(unsigned char)text[i];
+        if(c<' ' || c>='\x7f') return -1;
+        if(c==' ') { buffer[written++]='%'; buffer[written++]='s'; }
+        else buffer[written++]=(char)c;
+    }
+    buffer[written]='\0';
+    return input_request('T',0,0,0,buffer);
 }
+
+/* Multi-finger path used by MAA >= 6.3. `contact` is 1-based; Android's
+ * `input` command has no multi-touch primitive, so fingers beyond the first
+ * are reported as unavailable rather than silently mistapped. */
+int __cdecl nemu_input_event_finger_touch_down(int handle,int display,int contact,int x,int y) {
+    (void)display;
+    if(handle!=1 || contact!=1) return -1;
+    return input_request('D',(uint32_t)x,(uint32_t)y,0,NULL);
+}
+int __cdecl nemu_input_event_finger_touch_up(int handle,int display,int contact) {
+    (void)display;
+    if(handle!=1 || contact!=1) return -1;
+    return input_request('U',0,0,0,NULL);
+}
+
+/* Legacy single-finger names, still probed by older MAA builds. */
 int __cdecl nemu_input_event_touch_down(int handle,int display,int x,int y) {
-    (void)display; return handle==1?input_request('D',(uint32_t)x,(uint32_t)y,0):-1;
+    (void)display; return handle==1?input_request('D',(uint32_t)x,(uint32_t)y,0,NULL):-1;
 }
 int __cdecl nemu_input_event_touch_up(int handle,int display) {
-    (void)display; return handle==1?input_request('U',0,0,0):-1;
+    (void)display; return handle==1?input_request('U',0,0,0,NULL):-1;
 }
 int __cdecl nemu_input_event_key_down(int handle,int display,int key) {
-    (void)display; return handle==1?input_request('K',0,0,(uint32_t)key):-1;
+    (void)display; return handle==1?input_request('K',0,0,(uint32_t)key,NULL):-1;
 }
 int __cdecl nemu_input_event_key_up(int handle,int display,int key) {
     /* Android's `input keyevent` already delivers a complete press+release, so

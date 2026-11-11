@@ -53,6 +53,39 @@ def run(args, timeout=15, check=True, env=None):
     return r.stdout.strip()
 
 
+def adb_authorize(env):
+    """Adopt the ADB key MAA already registered, for the host's own adb.
+
+    A fresh `adb` install generates a new keypair, and Waydroid's adbd only
+    accepts the keys it was paired with — so the native adb reports
+    `device unauthorized` while MAA (whose key is already accepted) keeps
+    working. Copying MAA's keypair into ~/.android makes both agree; the
+    original host key is kept as `.orig` so nothing is silently destroyed.
+    Returns a short hint for the error message, or '' when it cannot help.
+    """
+    try:
+        prefix = Path(settings()['wine_prefix'])
+        source = prefix / 'drive_c/users' / os.environ.get('USER', 'simon') / '.android/adbkey'
+        if not source.exists():
+            return '；未找到 MAA 的 adb 密钥，请在 MAA 里点一次“测试连接”'
+        target = Path.home() / '.android/adbkey'
+        public = source.with_name('adbkey.pub')
+        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if target.exists() and target.read_bytes() == source.read_bytes():
+            return ''
+        if target.exists() and not target.with_suffix('.orig').exists():
+            shutil.copy2(target, target.with_suffix('.orig'))
+            shutil.copy2(target.with_name('adbkey.pub'),
+                         target.with_name('adbkey.pub.orig'))
+        shutil.copy2(source, target)
+        target.chmod(0o600)
+        if public.exists():
+            shutil.copy2(public, target.with_name('adbkey.pub'))
+        return '；已改用 MAA 已授权的 adb 密钥，请重试'
+    except (OSError, KeyError) as error:
+        return f'；无法复用 MAA 的 adb 密钥（{error}）'
+
+
 def maa_config():
     path = Path(settings()['maa_dir']) / 'config/gui.new.json'
     for attempt in range(4):
@@ -676,6 +709,10 @@ def prepare(slot_id, dry_run=False):
                 time.sleep(2)
         # Android may report boot_completed before adbd finishes reconnecting
         # a previously running Windows server, especially after a vendor change.
+        #
+        # `device unauthorized` after a fresh boot means this host has no key
+        # the container trusts. The key that MAA already registered lives in its
+        # Wine prefix; copying it here keeps both sides authorised.
         deadline = time.monotonic() + 120
         adb_error = 'device 尚未就绪'
         while True:
@@ -685,6 +722,8 @@ def prepare(slot_id, dry_run=False):
                 if device == 'device':
                     break
                 adb_error = device or 'ADB 返回空状态'
+                if 'unauthorized' in adb_error:
+                    adb_error += adb_authorize(env)
             except (subprocess.TimeoutExpired, RuntimeError) as error:
                 adb_error = str(error)
             if time.monotonic() >= deadline:

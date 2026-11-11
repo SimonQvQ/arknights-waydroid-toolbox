@@ -58,24 +58,42 @@ static int send_all(int fd,const void *data,size_t n) {
  * events, so the payload is forwarded to a long-lived `adb shell` instead of
  * spawning a process per event (a fork+exec costs ~70 ms, which is far too
  * slow for dragging and multi-finger gestures).
+ *
+ * The server gets its own adb daemon on port 5038. Sharing 5037 with MAA's
+ * adb.exe does not work: two servers race for the port, and whichever loses
+ * talks to a socket whose keys were never authorised, which surfaces as
+ * "device unauthorized" mid-run. A separate port keeps both sides independent.
  */
+#define ADB_PORT "5038"
+#define ADB_SERIAL "127.0.0.1:5555"
 static FILE *adb_shell = NULL;
+
+static void adb_offline(void) {
+    if (adb_shell) { pclose(adb_shell); adb_shell = NULL; }
+}
 
 static int adb_open(void) {
     if (adb_shell) return 0;
-    adb_shell = popen("/usr/bin/adb -s 127.0.0.1:5555 shell 2>/dev/null", "w");
+    char command[256];
+    /* `connect` is idempotent and revives the link after a Waydroid restart,
+     * which happens on every scheduled run. */
+    snprintf(command, sizeof(command),
+             "ANDROID_ADB_SERVER_PORT=" ADB_PORT " /usr/bin/adb connect " ADB_SERIAL
+             " >/dev/null 2>&1; ANDROID_ADB_SERVER_PORT=" ADB_PORT
+             " /usr/bin/adb -s " ADB_SERIAL " shell 2>/dev/null");
+    adb_shell = popen(command, "w");
     return adb_shell ? 0 : -1;
 }
 
 static int adb_command(const char *arguments) {
     if (adb_open()) return -1;
-    if (fprintf(adb_shell, "%s\n", arguments) < 0) { pclose(adb_shell); adb_shell = NULL; return -1; }
-    if (fflush(adb_shell) != 0) { pclose(adb_shell); adb_shell = NULL; return -1; }
+    if (fprintf(adb_shell, "%s\n", arguments) < 0) { adb_offline(); return -1; }
+    if (fflush(adb_shell) != 0) { adb_offline(); return -1; }
     return 0;
 }
 
-static int inject_input(char cmd, const CapHeader *in) {
-    char arguments[256];
+static int inject_input(char cmd, const CapHeader *in, const char *text) {
+    char arguments[512];
     int x = (int)in->width, y = (int)in->height;
     switch (cmd) {
     case 'D': snprintf(arguments, sizeof(arguments),
@@ -86,6 +104,10 @@ static int inject_input(char cmd, const CapHeader *in) {
                        "input motionevent MOVE %d %d", x, y); break;
     case 'K': snprintf(arguments, sizeof(arguments),
                        "input keyevent %u", in->bytes); break;
+    case 'T':
+        if (!text || !*text) return -1;
+        snprintf(arguments, sizeof(arguments), "input text '%s'", text);
+        break;
     default: return -1;
     }
     return adb_command(arguments);
@@ -143,7 +165,13 @@ int main(int argc,char **argv) {
                 close(client); continue;
             }
             CapHeader h={.magic=CAP_MAGIC,.status=0,.width=CAP_WIDTH,.height=CAP_HEIGHT};
-            if(inject_input(cmd,&in)) h.status=1;
+            char text[256];
+            text[0]='\0';
+            if(cmd=='T') {
+                ssize_t got=recv(client,text,sizeof(text)-1,MSG_WAITALL);
+                text[got>0?got:0]='\0';
+            }
+            if(inject_input(cmd,&in,text)) h.status=1;
             send_all(client,&h,sizeof(h));
             close(client); continue;
         }
