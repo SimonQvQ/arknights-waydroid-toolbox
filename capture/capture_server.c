@@ -65,31 +65,50 @@ static int send_all(int fd,const void *data,size_t n) {
  * "device unauthorized" mid-run. A separate port keeps both sides independent.
  */
 #define ADB_PORT "5038"
-#define ADB_SERIAL "127.0.0.1:5555"
-static FILE *adb_shell = NULL;
 
-static void adb_offline(void) {
-    if (adb_shell) { pclose(adb_shell); adb_shell = NULL; }
+/* Waydroid's container address is not fixed across vendors/installs, and MAA
+ * already carries the working one in its own config, so read it from there
+ * instead of hard-coding a guess. Falling back to the mainline default keeps a
+ * fresh install usable. */
+#define ADB_SERIAL_DEFAULT "192.168.240.112:5555"
+#define MAA_CONFIG "/home/simon/.local/share/maa-wine/app/config/gui.new.json"
+
+static char adb_serial[64] = ADB_SERIAL_DEFAULT;
+
+static void adb_resolve_serial(void) {
+    FILE *config = fopen(MAA_CONFIG, "r");
+    if (!config) return;
+    static char buffer[1 << 16];
+    size_t length = fread(buffer, 1, sizeof(buffer) - 1, config);
+    fclose(config);
+    buffer[length] = '\0';
+    /* The connect settings carry a single "Address": "host:port" pair; taking
+     * the first occurrence matches the active configuration MAA itself uses. */
+    const char *key = "\"Address\"";
+    char *found = strstr(buffer, key);
+    if (!found) return;
+    char *quote = strchr(found + strlen(key), ':');
+    if (!quote) return;
+    char *start = strchr(quote, '"');
+    if (!start) return;
+    start++;
+    char *end = strchr(start, '"');
+    if (!end || end - start <= 0 || (size_t)(end - start) >= sizeof(adb_serial)) return;
+    memcpy(adb_serial, start, (size_t)(end - start));
+    adb_serial[end - start] = '\0';
 }
 
-static int adb_open(void) {
-    if (adb_shell) return 0;
-    char command[256];
-    /* `connect` is idempotent and revives the link after a Waydroid restart,
-     * which happens on every scheduled run. */
-    snprintf(command, sizeof(command),
-             "ANDROID_ADB_SERVER_PORT=" ADB_PORT " /usr/bin/adb connect " ADB_SERIAL
-             " >/dev/null 2>&1; ANDROID_ADB_SERVER_PORT=" ADB_PORT
-             " /usr/bin/adb -s " ADB_SERIAL " shell 2>/dev/null");
-    adb_shell = popen(command, "w");
-    return adb_shell ? 0 : -1;
-}
-
+/* `adb shell` is deliberately NOT kept as a long-lived popen(): writing
+ * commands into a shell whose stdout is a pipe nobody drains blocks as soon as
+ * one command prints anything, which silently swallowed every tap. Each input
+ * event now runs its own short-lived adb invocation. */
 static int adb_command(const char *arguments) {
-    if (adb_open()) return -1;
-    if (fprintf(adb_shell, "%s\n", arguments) < 0) { adb_offline(); return -1; }
-    if (fflush(adb_shell) != 0) { adb_offline(); return -1; }
-    return 0;
+    char command[1024];
+    snprintf(command, sizeof(command),
+             "ANDROID_ADB_SERVER_PORT=" ADB_PORT " /usr/bin/adb -s %s shell %s "
+             ">/dev/null 2>&1", adb_serial, arguments);
+    int status = system(command);
+    return status == 0 ? 0 : -1;
 }
 
 static int inject_input(char cmd, const CapHeader *in, const char *text) {
@@ -136,6 +155,7 @@ static int capture(Display *d,Window w,unsigned char *out) {
 int main(int argc,char **argv) {
     if(argc!=3) { fprintf(stderr,"usage: capture-server DISPLAY SOCKET\n"); return 2; }
     signal(SIGPIPE,SIG_IGN); XSetErrorHandler(trap); umask(0077);
+    adb_resolve_serial();
     char lockpath[256]; snprintf(lockpath,sizeof(lockpath),"%s.lock",argv[2]);
     int lockfd=open(lockpath,O_CREAT|O_RDWR|O_CLOEXEC,0600);
     if(lockfd<0 || flock(lockfd,LOCK_EX|LOCK_NB)) return 3;
@@ -146,7 +166,8 @@ int main(int argc,char **argv) {
     strcpy(addr.sun_path,argv[2]); unlink(addr.sun_path);
     if(fd<0 || bind(fd,(struct sockaddr*)&addr,sizeof(addr)) || listen(fd,4)) return 6;
     unsigned char *pixels=malloc(CAP_BYTES); if(!pixels) return 7;
-    fprintf(stderr,"Ready display=%s socket=%s; fresh 1280x720 bottom-up RGBA\n",argv[1],argv[2]);
+    fprintf(stderr,"Ready display=%s socket=%s adb=%s; fresh 1280x720 bottom-up RGBA\n",
+            argv[1],argv[2],adb_serial);
     for(;;) {
         int client=accept4(fd,NULL,NULL,SOCK_CLOEXEC);
         if(client<0) { if(errno==EINTR) continue; break; }
@@ -171,7 +192,10 @@ int main(int argc,char **argv) {
                 ssize_t got=recv(client,text,sizeof(text)-1,MSG_WAITALL);
                 text[got>0?got:0]='\0';
             }
-            if(inject_input(cmd,&in,text)) h.status=1;
+            if(inject_input(cmd,&in,text)) {
+                h.status=1;
+                fprintf(stderr,"input %c failed\n",cmd);
+            }
             send_all(client,&h,sizeof(h));
             close(client); continue;
         }

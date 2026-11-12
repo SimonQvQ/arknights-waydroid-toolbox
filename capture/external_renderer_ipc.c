@@ -40,11 +40,15 @@ int __cdecl nemu_connect(const WCHAR *path,int index) {
     return index==0 && !request('I',&h,NULL,0)?1:0;
 }
 void __cdecl nemu_disconnect(int handle) { (void)handle; }
+/* MuMu numbers displays from 0, but MAA treats a 0 return as "no display"
+ * (`auto display_id = get_display_id(); if (!display_id) return false;`) and
+ * never forwards a touch. This shim only ever mirrors the single Waydroid
+ * window, so report display 1 and accept both 0 and 1 in capture/input. */
 int __cdecl nemu_get_display_id(int handle,const char *package,int app_index) {
-    (void)package; return handle==1 && app_index==0?0:-1;
+    (void)package; return handle==1 && app_index==0?1:-1;
 }
 int __cdecl nemu_capture_display(int handle,unsigned int display,int size,int *width,int *height,unsigned char *pixels) {
-    if(handle!=1 || display!=0 || !width || !height || size<0) return -1;
+    if(handle!=1 || (display!=0 && display!=1) || !width || !height || size<0) return -1;
     CapHeader h;
     if(request(size==0?'I':'C',&h,pixels,size)) return -1;
     *width=h.width; *height=h.height; return 0;
@@ -86,9 +90,11 @@ int __cdecl nemu_input_text(int handle,int length,const char *text) {
     return input_request('T',0,0,0,buffer);
 }
 
-/* Multi-finger path used by MAA >= 6.3. `contact` is 1-based; Android's
- * `input` command has no multi-touch primitive, so fingers beyond the first
- * are reported as unavailable rather than silently mistapped. */
+/* Multi-finger path used by MAA >= 6.3. MAA converts its internal 0-based
+ * contact index to MuMu's 1-based finger id before calling us, so the first
+ * finger arrives as 1. Android's `input` command has no multi-touch primitive,
+ * so additional fingers are reported as unavailable rather than silently
+ * mistapped. */
 int __cdecl nemu_input_event_finger_touch_down(int handle,int display,int contact,int x,int y) {
     (void)display;
     if(handle!=1 || contact!=1) return -1;
