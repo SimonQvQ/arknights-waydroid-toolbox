@@ -23,7 +23,11 @@ static int read_all(int fd,void *data,size_t n) {
 }
 static int request(char command,CapHeader *h,unsigned char *pixels,int capacity) {
     int fd=socket(AF_UNIX,SOCK_STREAM|SOCK_CLOEXEC,0); if(fd<0) return -1;
-    struct timeval timeout={.tv_sec=1};
+    /* The server shells out to adb per event, and a cold adb daemon can exceed
+     * one second on the first tap of a session. Too tight a receive timeout
+     * here surfaces as `Failed to touch_down[ret=-1]` on a perfectly good tap,
+     * so allow generous headroom; a stuck server still fails the tap. */
+    struct timeval timeout={.tv_sec=5};
     setsockopt(fd,SOL_SOCKET,SO_SNDTIMEO,&timeout,sizeof(timeout));
     setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout));
     struct sockaddr_un addr={.sun_family=AF_UNIX};
@@ -58,19 +62,32 @@ int __cdecl nemu_capture_display(int handle,unsigned int display,int size,int *w
  * it for nemu_input_text. Returns 0 when the server injected the event. */
 static int input_request(char command,uint32_t x,uint32_t y,uint32_t extra,const char *text) {
     int fd=socket(AF_UNIX,SOCK_STREAM|SOCK_CLOEXEC,0); if(fd<0) return -1;
-    struct timeval timeout={.tv_sec=1};
+    /* The server shells out to adb per event, and a cold adb daemon can exceed
+     * one second on the first tap of a session. Too tight a receive timeout
+     * here surfaces as `Failed to touch_down[ret=-1]` on a perfectly good tap,
+     * so allow generous headroom; a stuck server still fails the tap. */
+    struct timeval timeout={.tv_sec=5};
     setsockopt(fd,SOL_SOCKET,SO_SNDTIMEO,&timeout,sizeof(timeout));
     setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout));
     struct sockaddr_un addr={.sun_family=AF_UNIX};
     snprintf(addr.sun_path,sizeof(addr.sun_path),"/run/user/%lu/waydroid-mumu-capture.sock",(unsigned long)getuid());
     CapHeader in={.magic=CAP_MAGIC,.width=x,.height=y,.bytes=extra},h;
     size_t length=text?strlen(text)+1:0;
-    int ok=connect(fd,(struct sockaddr*)&addr,sizeof(addr))==0 &&
-        send(fd,&command,1,MSG_NOSIGNAL)==1 &&
-        send(fd,&in,sizeof(in),MSG_NOSIGNAL)==(ssize_t)sizeof(in) &&
-        (!length || send(fd,text,length,MSG_NOSIGNAL)==(ssize_t)length) &&
-        read_all(fd,&h,sizeof(h))==0 && h.magic==CAP_MAGIC && h.status==0;
-    close(fd); return ok?0:-1;
+    int step=0;
+    if(connect(fd,(struct sockaddr*)&addr,sizeof(addr))!=0) step=1;
+    else if(send(fd,&command,1,MSG_NOSIGNAL)!=1) step=2;
+    else if(send(fd,&in,sizeof(in),MSG_NOSIGNAL)!=(ssize_t)sizeof(in)) step=3;
+    else if(length && send(fd,text,length,MSG_NOSIGNAL)!=(ssize_t)length) step=4;
+    else if(read_all(fd,&h,sizeof(h))!=0) step=5;
+    else if(h.magic!=CAP_MAGIC) step=6;
+    else if(h.status!=0) step=7;
+    if(step){
+        FILE *f=fopen("/tmp/dll-input.log","a");
+        if(f){fprintf(f,"cmd=%c path=%s step=%d errno=%d status=%u\n",
+                      command,addr.sun_path,step,errno,h.status);fclose(f);}
+        close(fd); return -1;
+    }
+    close(fd); return 0;
 }
 /* nemu_input_text(handle, length, utf8). MAA only sends short ASCII strings
  * (operator search boxes). `adb shell input text` treats a space as an

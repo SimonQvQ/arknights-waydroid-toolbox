@@ -102,13 +102,29 @@ static void adb_resolve_serial(void) {
  * commands into a shell whose stdout is a pipe nobody drains blocks as soon as
  * one command prints anything, which silently swallowed every tap. Each input
  * event now runs its own short-lived adb invocation. */
+/* The private adb server on ADB_PORT starts empty: it is separate from MAA's
+ * own server on 5037, so a device connected there is invisible here. Every
+ * command therefore reconnects once on failure -- without this the very first
+ * tap of a session dies with "device not found" and the game never wakes up. */
+static int adb_ensure_device(void) {
+    char command[256];
+    snprintf(command, sizeof(command),
+             "ANDROID_ADB_SERVER_PORT=" ADB_PORT " /usr/bin/adb connect %s "
+             ">/dev/null 2>&1", adb_serial);
+    return system(command) == 0 ? 0 : -1;
+}
+
 static int adb_command(const char *arguments) {
     char command[1024];
-    snprintf(command, sizeof(command),
-             "ANDROID_ADB_SERVER_PORT=" ADB_PORT " /usr/bin/adb -s %s shell %s "
-             ">/dev/null 2>&1", adb_serial, arguments);
-    int status = system(command);
-    return status == 0 ? 0 : -1;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        snprintf(command, sizeof(command),
+                 "ANDROID_ADB_SERVER_PORT=" ADB_PORT " /usr/bin/adb -s %s shell %s "
+                 ">/dev/null 2>&1", adb_serial, arguments);
+        if (system(command) == 0) return 0;
+        if (attempt == 0) adb_ensure_device();
+    }
+    fprintf(stderr, "adb_command failed cmd=[%s] errno=%d\n", command, errno);
+    return -1;
 }
 
 static int inject_input(char cmd, const CapHeader *in, const char *text) {
@@ -156,6 +172,12 @@ int main(int argc,char **argv) {
     if(argc!=3) { fprintf(stderr,"usage: capture-server DISPLAY SOCKET\n"); return 2; }
     signal(SIGPIPE,SIG_IGN); XSetErrorHandler(trap); umask(0077);
     adb_resolve_serial();
+    /* Warm the private adb server before the socket exists. The client side
+     * allows a tap request only a short timeout, and the very first `adb`
+     * invocation of a session pays for starting the daemon and the device
+     * handshake. Doing it here means the first real tap is as cheap as the
+     * rest. Failure is not fatal: adb_command retries with a reconnect. */
+    adb_ensure_device();
     char lockpath[256]; snprintf(lockpath,sizeof(lockpath),"%s.lock",argv[2]);
     int lockfd=open(lockpath,O_CREAT|O_RDWR|O_CLOEXEC,0600);
     if(lockfd<0 || flock(lockfd,LOCK_EX|LOCK_NB)) return 3;
