@@ -78,13 +78,21 @@ ARKNIGHTS_TOOLBOX_BACKEND="$PWD/backend/toolbox.py" flutter run -d linux
 }
 ```
 
-其中 `lutris_game_id` 必须是你自己 MAA 项目的 ID。MAA 至少启动过一次，生成 `config/gui.new.json`。在 MAA 中设置 Windows `adb.exe` 路径和 Waydroid 实际 IP:5555，完成 Android ADB 授权，使用 **MaaTouch** 和 ADB Lite。不要开启 MuMu 触控增强。
+其中 `lutris_game_id` 必须是你自己 MAA 项目的 ID。MAA 至少启动过一次，生成 `config/gui.new.json`。在 MAA 中设置 Windows `adb.exe` 路径和 Waydroid 实际 IP:5555，完成 Android ADB 授权。触控用 **MumuExtras**，且必须与 `Config` 保持同步（`prepare()` 会自动校正）：`Config` 为 `MuMuEmulator12` 时 `TouchMode` 才能是 `MumuExtras`；两者不一致时 MAA 会静默回落到 `AdbController`，表现为「已是点击的坐标，却什么都没发生」。MaaTouch 与 `MuMuEmulator12` 互斥，MAA 会拒绝混用。
 
 先手动确认 HUD、MAA 和连接测试成功，再在工具箱启用截图增强及 Linux 定时。HUD 启动脚本首次启动会停止已有 Waydroid 会话以切换显示环境；定时准备检测到其他 Waydroid 显示会话时会先停止它，再通过 HUD 重新拉起 `waydroid-mangoapp`。
 
 ## 截图兼容层的原理和范围
 
-[`capture/`](capture/) 是独立实现，不包含 MuMu 的专有 DLL。winegcc 构建的 Winelib DLL 实现 MAA 已有的部分 MuMu SDK ABI，经当前用户专用 Unix socket 请求原生服务即时读取内层 Weston 的 X11 窗口。MAA 从自己的连接设置加载它；不替换 MAA.exe、MaaCore.dll 或修改资源文件。输入仍使用 MaaTouch。
+[`capture/`](capture/) 是独立实现，不包含 MuMu 的专有 DLL。winegcc 构建的 Winelib DLL 实现 MAA 已有的部分 MuMu SDK ABI，经当前用户专用 Unix socket 请求原生服务即时读取内层 Weston 的 X11 窗口。MAA 从自己的连接设置加载它；不替换 MAA.exe、MaaCore.dll 或修改资源文件。输入同样经这条路径，落到宿主的 `input tap`／`input swipe`／`input keyevent`。
+
+MAA 会先按 `nx_device/<版本>/shell/sdk/` 探测 MuMu 的原生 DLL，找不到才回落到配置里的 `EmulatorPath`。日志里出现 `LoadLibrary failed ... nx_device/15.0/... err=126` 属于正常探测失败，不代表截图不可用。
+
+### 伸手不见五指的两种输入 bug
+
+MuMu 的输入 ABI 拆成 down / move / up 三个事件，但 **up 不带坐标**：`nemu_input_event_finger_touch_up(handle, display, contact)` 只传句柄、显示号和触点号。任何把 up 请求头里的 `width`/`height` 当成落点的实现都会把 `(0, 0)` 当成终点，于是每个点按都变成 `input swipe <x> <y> 0 0 300`——一次朝左上角的甩动，而不是点击。判断"是否拖拽"只能看有没有出现过 move 事件。
+
+另一个坑是 down/up 必须合成一次注入。分成两条 `input motionevent DOWN` / `UP` 命令发出去时，两条命令各带自己的 downTime，系统不会把它们配成一次手势。
 
 目前固定为本项目启动器中的单个 1280×720 Weston 窗口，不支持任意分辨率、多开或 Android 安全画面。每次请求执行新的 XGetImage，不预先生成或重复发送缓存图片。服务故障与 MAA 进程隔离，systemd 会重新探测专用 Weston。
 
