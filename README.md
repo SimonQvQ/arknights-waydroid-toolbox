@@ -130,3 +130,59 @@ sudo pacman -Rns arknights-waydroid-toolbox-bin
 20260927 MAINLINE vendor 在开发机出现显示焦点/HWC 死锁，Android watchdog 在准备后重启框架，随后网络栈失效。症状是 Linux 准备曾成功，而 MAA 到点报连接失败。与上游 https://github.com/waydroid/waydroid/issues/2436 的阻塞栈一致；开发机只回退官方 20260428 MAINLINE vendor 进行验证，未替换 system 或删除用户数据。不要在不了解兼容性时自动回退其他设备；更新镜像前核对上游进展并备份。
 
 启动成功仅表示当时连接正常，不表示之后 MAA 游戏任务完成。排查时要同时查看 Android watchdog/ANR、MAA 日志和 systemd 日志，并覆盖后台等待与窗口焦点切换。
+
+## Mesa 26.2.6 的 i915 dma-buf 死锁
+
+2026-11-08 的 `mesa 26.2.5-1 → 26.2.6-1` 升级会让 `gamescope --backend sdl` 的显示链路死锁，症状是**画面永久冻结，但游戏线程仍在满速渲染**：
+
+```console
+$ grep -c unsignalled /sys/kernel/debug/dma_buf/bufinfo
+13
+$ grep -A1 'read fence' /sys/kernel/debug/dma_buf/bufinfo | grep gamescope
+	read fence:3281:94074 gamescope-sdl[805157] 0000:00:02.0 unsignalled
+$ dumpsys SurfaceFlinger --latency <component>   # 只回一行 16666666，没有帧时间戳
+```
+
+`UnityMain` 和 `UnityGfxDeviceW` 的 CPU tick 正常增长，但合成器拿不到完成的 fence，因此没有任何新帧出屏。MAA 只能反复识别同一张旧图，`cur_retry` 一路涨到 20 并空转占满 CPU —— **MAA 的高 CPU 是结果，不是原因**。杀掉 MAA 不会恢复，只有清掉 fence 才会。
+
+判断要点：
+
+- `unsignalled` 计数**只增不减**是死锁；在 0 到 14 之间上下波动属于正常（每帧的 fence 会正常完成）。
+- `ps -eo stat,comm | grep i915_flip` 出现 `D` 状态可以佐证，但**没有 `D` 也不代表没问题**：坏 fence 可以只存在于用户态。
+- 与截图兼容层无关：把 `waydroid-mumu-capture.service` 停掉后 fence 照样泄漏，`TouchMode=MaaTouch` 也照样冻结。
+
+处置：装回 `mesa 26.2.5-1` 与 `vulkan-intel 26.2.5-1`，然后用 `toolbox.py game-start` 重建显示栈。
+
+```console
+$ sudo pacman -U --noconfirm --nodeps \
+    /var/cache/pacman/pkg/mesa-3:26.2.5-1-x86_64_v3.pkg.tar.zst \
+    /var/cache/pacman/pkg/vulkan-intel-3:26.2.5-1-x86_64_v3.pkg.tar.zst
+```
+
+降级后务必在 `/etc/pacman.conf` 里锁住，否则下次 `pacman -Syu` 会把 26.2.6 装回来：
+
+```ini
+IgnorePkg = mesa lib32-mesa opencl-mesa lib32-opencl-mesa vulkan-intel lib32-vulkan-intel \
+            vulkan-mesa-implicit-layers lib32-vulkan-mesa-implicit-layers
+```
+
+实测对比（同一台机器、同一条 `StartUp → Fight(TL-4)` 队列，走真实 systemd 定时器）：
+
+| 指标 | mesa 26.2.6 | mesa 26.2.5 |
+| --- | --- | --- |
+| 画面 | 冻结在 `mean=41.5` | 持续变化 |
+| `unsignalled` fence | 13，恒定 | 0–14 波动后归零 |
+| `mumu click` | 6 | 63 |
+| `Failed to touch` | 0 | 0 |
+| 合成器/CPU | MAA 空转 200 %+ | 5–35 % |
+
+## 不要在容器坏掉时手工修补 lxc 配置
+
+用 `kill -9` 清理显示栈时如果连带杀掉 `waydroid container start`，容易出现「`waydroid-container.service` 是 active，但 `lxc-ls` 为空」的假活状态。此时手工 `ip link add` 建 `waydroid0`、手工起 `dnsmasq`、手工 `mkdir /usr/lib/lxc/rootfs/dev` 都**只会把问题越弄越糟**：`waydroid-net.sh` 看到已存在的网桥不会再建，而清理分支又因为 `brif/` 为空把它删掉，于是永久失败。
+
+正确恢复顺序：
+
+1. 杀掉真正卡住的 `python3 /usr/bin/waydroid container start`（用 `ps` 精确匹配参数，不要用 `pkill -f`，它会匹配到自己所在的 shell）。
+2. 清掉残留的 `dnsmasq`（`192.168.240.1: address already in use` 就是它）。
+3. 用 **`waydroid session start`**，不要用 `container start`。会话启动才会走完整的 overlay 挂载；`container start` 只拉起容器管理进程，rootfs 会是空的（只剩 `proc/` 和 `sys/`）。
+4. 用 `getprop sys.boot_completed` 等 `1`，不要相信 `adb devices` —— 容器没起来时它照样会列出一个 `offline`/幽灵条目。
