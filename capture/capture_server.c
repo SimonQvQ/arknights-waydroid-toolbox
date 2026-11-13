@@ -147,8 +147,16 @@ static int inject_input(char cmd, const CapHeader *in, const char *text) {
     case 'U': {
         if (gesture_x < 0) return -1;
         int x0 = gesture_x, y0 = gesture_y;
-        int x1 = gesture_last_x >= 0 ? gesture_last_x : x;
-        int y1 = gesture_last_y >= 0 ? gesture_last_y : y;
+        /* Only an explicit move event can turn this gesture into a drag. The
+         * up event itself carries no position: MAA calls
+         * nemu_input_event_finger_touch_up(handle, display, contact), so the
+         * header arrives with width/height still zero. Reading x/y here made
+         * every plain tap compare its origin against (0, 0), which always
+         * differed and was sent as `input swipe <x> <y> 0 0 300` - a flick to
+         * the top-left corner instead of a tap. */
+        int moved = gesture_last_x >= 0;
+        int x1 = moved ? gesture_last_x : x0;
+        int y1 = moved ? gesture_last_y : y0;
         gesture_x = gesture_y = gesture_last_x = gesture_last_y = -1;
         if (x1 != x0 || y1 != y0)
             snprintf(arguments, sizeof(arguments),
