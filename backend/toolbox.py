@@ -480,7 +480,11 @@ def capture_mode(enabled):
     extra.update({'IsEnabled': enabled, 'EmulatorPath': 'Z:' + settings()['sdk_dir'].replace('/', '\\'),
                   'EnableBridgeConnection': True, 'InstanceIndex': 0})
     c['Config'] = 'MuMuEmulator12' if enabled else 'General'
-    c['TouchMode'] = 'MaaTouch'
+    # The two settings must agree: MuMuExtras only exists while Config is
+    # MuMuEmulator12, and asking for it under General makes MAA fall back to
+    # AdbController. MaaTouch, in turn, is the minitouch backend that MAA
+    # probes separately and refuses to mix with MuMuEmulator12.
+    c['TouchMode'] = 'MumuExtras' if enabled else 'MaaTouch'
     c['EnableAdbLite'] = True
     atomic_json(path, config)
     if enabled:
