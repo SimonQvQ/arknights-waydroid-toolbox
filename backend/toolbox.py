@@ -174,6 +174,33 @@ def display_stack(root='/proc'):
     return found
 
 
+def fence_stall(samples=6, interval=1.0, minimum=3):
+    """Detect the Mesa 26.2.6 i915 dma-buf deadlock.
+
+    A stalled fence shows up as `read fence ... gamescope-sdl[pid] ...
+    unsignalled` in bufinfo. Counting them is necessary but not sufficient:
+    a healthy compositor recycles fences constantly, so short runs of equal
+    readings happen by chance. The deadlock is distinguishable because the
+    same fences stay pending for the whole window -- the count is pinned and
+    never dips, across a longer sample than frame pacing would ever hold.
+    Returns the pinned count when stalled, else None.
+    """
+    buf = Path('/sys/kernel/debug/dma_buf/bufinfo')
+    seen = []
+    for i in range(max(2, samples)):
+        try:
+            text = buf.read_text()
+        except OSError:
+            return None  # no debugfs access; stay silent rather than guess
+        seen.append(sum('unsignalled' in ln and 'gamescope' in ln
+                        for ln in text.splitlines()))
+        if i + 1 < samples:
+            time.sleep(interval)
+    if seen[0] >= minimum and len(set(seen)) == 1:
+        return seen[0]
+    return None
+
+
 def stale_display_pids(root='/proc'):
     """PIDs of HUD-spawned display processes that no longer form a valid stack.
 
