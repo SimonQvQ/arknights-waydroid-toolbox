@@ -127,16 +127,36 @@ static int adb_command(const char *arguments) {
     return -1;
 }
 
+/* A gesture arrives as a down, zero or more moves and an up. Those must become
+ * ONE `input tap`/`input swipe`: `input motionevent DOWN` and `... UP` are two
+ * independent injections, each with its own downTime, so the game receives an
+ * orphan up and reports no tap at all. That is why Arknights ignored hundreds
+ * of perfectly delivered touches and sat on its title screen. */
+static int gesture_x = -1, gesture_y = -1, gesture_last_x = -1, gesture_last_y = -1;
+
 static int inject_input(char cmd, const CapHeader *in, const char *text) {
     char arguments[512];
     int x = (int)in->width, y = (int)in->height;
     switch (cmd) {
-    case 'D': snprintf(arguments, sizeof(arguments),
-                       "input motionevent DOWN %d %d", x, y); break;
-    case 'U': snprintf(arguments, sizeof(arguments),
-                       "input motionevent UP %d %d", x, y); break;
-    case 'M': snprintf(arguments, sizeof(arguments),
-                       "input motionevent MOVE %d %d", x, y); break;
+    case 'D':
+        gesture_x = x; gesture_y = y; gesture_last_x = -1; gesture_last_y = -1;
+        return 0;
+    case 'M':
+        gesture_last_x = x; gesture_last_y = y;
+        return 0;
+    case 'U': {
+        if (gesture_x < 0) return -1;
+        int x0 = gesture_x, y0 = gesture_y;
+        int x1 = gesture_last_x >= 0 ? gesture_last_x : x;
+        int y1 = gesture_last_y >= 0 ? gesture_last_y : y;
+        gesture_x = gesture_y = gesture_last_x = gesture_last_y = -1;
+        if (x1 != x0 || y1 != y0)
+            snprintf(arguments, sizeof(arguments),
+                     "input swipe %d %d %d %d 300", x0, y0, x1, y1);
+        else
+            snprintf(arguments, sizeof(arguments), "input tap %d %d", x0, y0);
+        break;
+    }
     case 'K': snprintf(arguments, sizeof(arguments),
                        "input keyevent %u", in->bytes); break;
     case 'T':

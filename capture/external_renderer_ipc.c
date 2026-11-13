@@ -73,18 +73,11 @@ static int input_request(char command,uint32_t x,uint32_t y,uint32_t extra,const
     snprintf(addr.sun_path,sizeof(addr.sun_path),"/run/user/%lu/waydroid-mumu-capture.sock",(unsigned long)getuid());
     CapHeader in={.magic=CAP_MAGIC,.width=x,.height=y,.bytes=extra},h;
     size_t length=text?strlen(text)+1:0;
-    int step=0;
-    if(connect(fd,(struct sockaddr*)&addr,sizeof(addr))!=0) step=1;
-    else if(send(fd,&command,1,MSG_NOSIGNAL)!=1) step=2;
-    else if(send(fd,&in,sizeof(in),MSG_NOSIGNAL)!=(ssize_t)sizeof(in)) step=3;
-    else if(length && send(fd,text,length,MSG_NOSIGNAL)!=(ssize_t)length) step=4;
-    else if(read_all(fd,&h,sizeof(h))!=0) step=5;
-    else if(h.magic!=CAP_MAGIC) step=6;
-    else if(h.status!=0) step=7;
-    if(step){
-        FILE *f=fopen("/tmp/dll-input.log","a");
-        if(f){fprintf(f,"cmd=%c path=%s step=%d errno=%d status=%u\n",
-                      command,addr.sun_path,step,errno,h.status);fclose(f);}
+    if(connect(fd,(struct sockaddr*)&addr,sizeof(addr))!=0 ||
+       send(fd,&command,1,MSG_NOSIGNAL)!=1 ||
+       send(fd,&in,sizeof(in),MSG_NOSIGNAL)!=(ssize_t)sizeof(in) ||
+       (length && send(fd,text,length,MSG_NOSIGNAL)!=(ssize_t)length) ||
+       read_all(fd,&h,sizeof(h))!=0 || h.magic!=CAP_MAGIC || h.status!=0) {
         close(fd); return -1;
     }
     close(fd); return 0;
